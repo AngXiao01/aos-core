@@ -1,0 +1,18 @@
+{
+  "type": "sys/TaskReport",
+  "major": 1,
+  "fields": {
+    "did": {
+      "required": true
+    },
+    "why": {
+      "required": true
+    },
+    "uncertain": {
+      "required": true
+    },
+    "check_ids": {
+      "required": true
+    }
+  }
+}

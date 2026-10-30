@@ -1,0 +1,15 @@
+[package]
+name = "aos-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+## Reserved for hosts that want the crate named in their std graph.
+## Execution itself is `no_std + alloc`.
+std = []
+
+[dependencies]
+aos-types = { workspace = true }

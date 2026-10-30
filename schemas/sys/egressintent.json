@@ -1,0 +1,33 @@
+{
+  "type": "sys/EgressIntent",
+  "major": 1,
+  "fields": {
+    "channel": {
+      "required": true
+    },
+    "target": {
+      "required": true
+    },
+    "target_ref": {
+      "required": true
+    },
+    "payload_hash": {
+      "required": true
+    },
+    "external_reversibility": {
+      "required": true
+    },
+    "cost_money_fen": {
+      "required": true
+    },
+    "status": {
+      "required": true
+    },
+    "lineage_tainted": {
+      "required": true
+    },
+    "policy_decision": {
+      "required": true
+    }
+  }
+}

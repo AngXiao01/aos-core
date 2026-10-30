@@ -1,0 +1,15 @@
+{
+  "type": "sys/EgressReceipt",
+  "major": 1,
+  "fields": {
+    "intent": {
+      "required": true
+    },
+    "ok": {
+      "required": true
+    },
+    "detail": {
+      "required": true
+    }
+  }
+}

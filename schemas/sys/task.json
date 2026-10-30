@@ -1,0 +1,24 @@
+{
+  "type": "sys/Task",
+  "major": 1,
+  "fields": {
+    "intent": {
+      "required": true
+    },
+    "plan": {
+      "required": true
+    },
+    "branch": {
+      "required": true
+    },
+    "capability": {
+      "required": true
+    },
+    "status": {
+      "required": true
+    },
+    "report": {
+      "required": true
+    }
+  }
+}

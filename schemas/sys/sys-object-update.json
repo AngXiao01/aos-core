@@ -1,0 +1,13 @@
+{
+  "action": "sys.object.update",
+  "version": 1,
+  "reversibility": "undo",
+  "capability": "sys.object.write",
+  "reads": [
+    "sys/Object"
+  ],
+  "writes": [
+    "sys/Object"
+  ],
+  "egress": []
+}

@@ -1,0 +1,20 @@
+[package]
+name = "aos-egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+aos-types = { workspace = true }
+aos-log = { workspace = true }
+aos-branch = { workspace = true }
+aos-cap = { workspace = true }
+aos-policy = { workspace = true }
+aos-confirm = { workspace = true }
+aos-action = { workspace = true }
+aos-query = { workspace = true }

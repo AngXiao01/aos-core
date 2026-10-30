@@ -1,0 +1,25 @@
+[package]
+name = "aos-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["dev-confirmer"]
+dev-confirmer = ["aos-confirm/dev-confirmer"]
+
+[dependencies]
+aos-types = { workspace = true }
+aos-log = { workspace = true }
+aos-branch = { workspace = true }
+aos-cap = { workspace = true }
+aos-policy = { workspace = true }
+aos-action = { workspace = true }
+aos-egress = { workspace = true }
+aos-confirm = { workspace = true }
+aos-query = { workspace = true }
+
+[dev-dependencies]
+wasmi = "=0.46.0"
+wat = "=1.246.2"

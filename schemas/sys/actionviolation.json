@@ -1,0 +1,15 @@
+{
+  "type": "sys/ActionViolation",
+  "major": 1,
+  "fields": {
+    "action": {
+      "required": true
+    },
+    "reason": {
+      "required": true
+    },
+    "branch": {
+      "required": true
+    }
+  }
+}

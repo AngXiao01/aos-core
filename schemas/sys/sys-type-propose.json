@@ -1,0 +1,13 @@
+{
+  "action": "sys.type.propose",
+  "version": 1,
+  "reversibility": "undo",
+  "capability": "sys.type.write",
+  "reads": [
+    "sys/Object"
+  ],
+  "writes": [
+    "sys/Object"
+  ],
+  "egress": []
+}

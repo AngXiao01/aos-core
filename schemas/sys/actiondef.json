@@ -1,0 +1,33 @@
+{
+  "type": "sys/ActionDef",
+  "major": 1,
+  "fields": {
+    "name": {
+      "required": true
+    },
+    "version": {
+      "required": true
+    },
+    "summary": {
+      "required": true
+    },
+    "reversibility": {
+      "required": true
+    },
+    "capability": {
+      "required": true
+    },
+    "reads": {
+      "required": true
+    },
+    "writes": {
+      "required": true
+    },
+    "egress": {
+      "required": true
+    },
+    "idempotency": {
+      "required": true
+    }
+  }
+}
