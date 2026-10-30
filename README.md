@@ -1,13 +1,12 @@
 # aos-core
 
-AOS（agent-native OS）的共享核心规格，以及两个实现版本共用的核心库。
+AOS（agent-native OS）的运行时版：作为常驻程序直接运行在现有的 macOS 或 Linux 上，不需要虚拟机，本地作业可以使用宿主机的 GPU。
 
-- 规格：[`00-core-spec.md`](00-core-spec.md)
-- 版本 A（Linux 上的独立世界）：[AngXiao01/aos-linux](https://github.com/AngXiao01/aos-linux)
-- 版本 B（Rust 能力式微内核）：[AngXiao01/aos-microkernel](https://github.com/AngXiao01/aos-microkernel)
-
-本仓库将承载核心规格 §18 里列出的 `no_std` crate（`aos-types`、`aos-log`、`aos-branch` 等）和一致性测试套件 `aos-conformance`。两个版本都依赖这里的代码，并且必须通过同一套一致性测试。
+本仓库自成一体，不依赖任何其他仓库。唯一的规格文件是 [`SPEC.md`](SPEC.md)，第一部分规定系统语义，第二部分规定平台实现。
 
 ## 给实现 agent
 
-先完整阅读 `00-core-spec.md` 的 §0。决定写进 `DECISIONS.md`，矛盾写进 `QUESTIONS.md`。
+1. 先读 `SPEC.md` 的 §0，再通读全文。
+2. 按 §18 的仓库布局组织代码。核心库、人的界面、iPhone 确认器都在本仓库内实现。
+3. §C1 的威胁模型决定了这个版本防什么、不防什么，实现时不要越过它，也不要假装防住了范围之外的东西。
+4. 决定写进 `DECISIONS.md`，矛盾写进 `QUESTIONS.md`。
