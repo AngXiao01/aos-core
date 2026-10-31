@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use aos_types::cbor::CborError;
 use aos_types::{crypto, Cbor, Predicate, Sensitivity};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,19 +143,25 @@ fn aos_cap_covers(pattern: &str, needed: &str) -> bool {
     pattern == needed
 }
 
-pub fn policy_signing_bytes(policy: &Policy) -> alloc::vec::Vec<u8> {
-    policy_cbor(policy).canonical().expect("policy cbor")
+/// Canonical bytes the confirmer signs. Fails when a `when` value has no
+/// canonical form (a NaN or infinite float); such a policy cannot be signed.
+pub fn policy_signing_bytes(policy: &Policy) -> Result<alloc::vec::Vec<u8>, CborError> {
+    policy_cbor(policy)?.canonical()
 }
 
 pub fn sign_policy(policy: &Policy, seed32: &[u8; 32]) -> Result<[u8; 64], ()> {
-    crypto::sign(seed32, &policy_signing_bytes(policy))
+    let bytes = policy_signing_bytes(policy).map_err(|_| ())?;
+    crypto::sign(seed32, &bytes)
 }
 
 pub fn verify_policy(policy: &Policy, public_key: &[u8], signature: &[u8]) -> bool {
-    crypto::verify(public_key, &policy_signing_bytes(policy), signature)
+    match policy_signing_bytes(policy) {
+        Ok(bytes) => crypto::verify(public_key, &bytes, signature),
+        Err(_) => false,
+    }
 }
 
-fn policy_cbor(policy: &Policy) -> Cbor {
+fn policy_cbor(policy: &Policy) -> Result<Cbor, CborError> {
     let mut rules = alloc::vec::Vec::new();
     for rule in &policy.rules {
         let mut pairs = alloc::vec![
@@ -177,20 +184,18 @@ fn policy_cbor(policy: &Policy) -> Cbor {
             pairs.push((Cbor::Text("max_cost_fen_per_day".into()), Cbor::Uint(c)));
         }
         if let Some(pred) = &rule.when {
-            if let Ok(c) = pred.to_cbor() {
-                pairs.push((Cbor::Text("when".into()), c));
-            }
+            pairs.push((Cbor::Text("when".into()), pred.to_cbor()?));
         }
         rules.push(Cbor::Map(pairs));
     }
-    Cbor::Map(alloc::vec![
+    Ok(Cbor::Map(alloc::vec![
         (Cbor::Text("name".into()), Cbor::Text(policy.name.clone())),
         (
             Cbor::Text("default".into()),
             Cbor::Text(policy.default.as_str().into()),
         ),
         (Cbor::Text("rules".into()), Cbor::Array(rules)),
-    ])
+    ]))
 }
 
 #[cfg(test)]

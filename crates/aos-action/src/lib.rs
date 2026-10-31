@@ -44,6 +44,8 @@ pub enum ActionError {
     AbiVersion,
     JobTransition,
     RemoteJob,
+    /// An input has no canonical CBOR form, so it cannot be hashed or logged.
+    Encoding,
 }
 
 pub fn is_foreign_import(module: &str, name: &str) -> bool {
@@ -101,15 +103,18 @@ pub fn check_idempotency(
     }
 }
 
-pub fn input_hash(parts: &[Value]) -> [u8; 32] {
+/// Length-prefixed canonical CBOR of each part. A part that cannot be encoded
+/// is an error: skipping it would make `[NaN]` and `[]` hash the same and
+/// replay one call's result for another.
+pub fn input_hash(parts: &[Value]) -> Result<[u8; 32], ActionError> {
     let mut buf = Vec::new();
     for p in parts {
-        if let Ok(bytes) = p.canonical() {
-            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&bytes);
-        }
+        let bytes = p.canonical().map_err(|_| ActionError::Encoding)?;
+        let len = u32::try_from(bytes.len()).map_err(|_| ActionError::Encoding)?;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&bytes);
     }
-    sha256(&buf)
+    Ok(sha256(&buf))
 }
 
 pub fn authorize(
@@ -185,25 +190,20 @@ pub fn transition(from: JobState, to: JobState) -> Result<JobState, ActionError>
 }
 
 /// Remote submission is an egress intent whose action is `compensate`.
+/// A local job runs without network inside the sandbox (§8.5): it is an
+/// internal `undo` action and must not carry an egress intent.
 pub fn check_remote_job(
     kind: &str,
     reversibility: &str,
     has_intent: bool,
 ) -> Result<(), ActionError> {
-    if kind == "remote" {
-        if reversibility == "compensate" && has_intent {
-            Ok(())
-        } else {
-            Err(ActionError::RemoteJob)
-        }
-    } else if kind == "local" {
-        if reversibility == "undo" && !has_intent {
-            Ok(())
-        } else if reversibility == "undo" {
-            Ok(())
-        } else {
-            Err(ActionError::RemoteJob)
-        }
+    let ok = match kind {
+        "remote" => reversibility == "compensate" && has_intent,
+        "local" => reversibility == "undo" && !has_intent,
+        _ => false,
+    };
+    if ok {
+        Ok(())
     } else {
         Err(ActionError::RemoteJob)
     }
@@ -270,6 +270,20 @@ mod tests {
         assert!(transition(JobState::Succeeded, JobState::Running).is_err());
         assert!(check_remote_job("remote", "undo", false).is_err());
         assert!(check_remote_job("remote", "compensate", true).is_ok());
+        assert!(check_remote_job("local", "undo", false).is_ok());
+        assert!(check_remote_job("local", "undo", true).is_err());
+    }
+
+    #[test]
+    fn input_hash_does_not_skip_unencodable_parts() {
+        assert_eq!(
+            input_hash(&[Value::Float(f64::NAN)]).unwrap_err(),
+            ActionError::Encoding
+        );
+        assert_ne!(
+            input_hash(&[Value::Int(1)]).unwrap(),
+            input_hash(&[]).unwrap()
+        );
     }
 
     #[test]

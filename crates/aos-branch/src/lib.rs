@@ -32,6 +32,15 @@ pub enum BranchError {
     Patch,
     Store,
     BadEntry,
+    /// A value in the transaction has no canonical CBOR form (NaN, ±inf,
+    /// nesting too deep), so the entry cannot be hashed into the log.
+    Encoding,
+    /// The transaction is already undone by a revert that is still in force.
+    /// Revert that revert instead.
+    AlreadyReverted,
+    /// Branches fork from `main@seq` only (§7.3). Rebase and submit compare
+    /// against `main`, so a fork of a fork would lose its parent's writes.
+    ForkBase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,11 +173,15 @@ where
         if !self.branches.contains_key(from) {
             return Err(BranchError::MissingBranch);
         }
+        if from != "main" {
+            return Err(BranchError::ForkBase);
+        }
         let mut inputs = BTreeMap::new();
         inputs.insert("from".into(), Value::Text(from.into()));
         inputs.insert("name".into(), Value::Text(name.into()));
         inputs.insert("at_seq".into(), Value::Int(self.tip_seq() as i64));
         self.append(
+            None,
             name,
             Actor::System,
             "sys.branch.fork",
@@ -256,7 +269,10 @@ where
                 after,
             });
         }
+        // The entry carries the id returned here even when it has no writes
+        // (a ledger-only or intent-only call), so `revert(tx_id)` finds it.
         self.append(
+            Some(tx_id),
             &tx.branch,
             tx.actor,
             &tx.action,
@@ -273,13 +289,21 @@ where
         Ok(tx_id)
     }
 
+    /// Append the inverse of `tx`. Each write applies the inverse patch stored
+    /// with it (DECISIONS: undo uses the patch algebra), so only the paths that
+    /// `tx` changed go back; later writes to other fields of the same object
+    /// survive. A transaction can be undone once while that undo is in force;
+    /// otherwise its ledger refund could be collected repeatedly.
     pub fn revert(
         &mut self,
         branch: &str,
         tx: ObjectId,
         actor: Actor,
     ) -> Result<ObjectId, BranchError> {
-        let entry = self.find_tx(branch, tx).ok_or(BranchError::NotFound)?;
+        let (entry, in_force) = self.find_tx_in_force(branch, tx)?;
+        if !in_force {
+            return Err(BranchError::AlreadyReverted);
+        }
         let state = self
             .branches
             .get(branch)
@@ -291,13 +315,11 @@ where
             self.ids.next(ms, rnd)
         };
         for w in &entry.writes {
-            let current = state
-                .root
-                .get(&w.id)
-                .cloned()
-                .unwrap_or_else(|| absent_shell(w.id));
-            let prev = state.root.get(&w.id).map(|o| o.version).unwrap_or(0);
-            let mut restored = w.before.clone();
+            let existing = state.root.get(&w.id);
+            let prev = existing.map(|o| o.version).unwrap_or(0);
+            let current = existing.cloned().unwrap_or_else(|| absent_shell(w.id));
+            let mut restored = current.clone();
+            apply_patch(&mut restored, &w.inverse).map_err(|_| BranchError::Patch)?;
             restored.version = prev + 1;
             restored.provenance.tx = Some(new_tx);
             restored.provenance.actor = actor.clone();
@@ -317,6 +339,7 @@ where
         let mut inputs = BTreeMap::new();
         inputs.insert("reverts".into(), Value::Text(tx.to_text()));
         self.append(
+            Some(new_tx),
             branch,
             actor,
             "sys.revert",
@@ -386,6 +409,7 @@ where
             });
         }
         self.append(
+            Some(new_tx),
             branch,
             Actor::System,
             "sys.branch.rebase",
@@ -423,6 +447,7 @@ where
         let mut inputs = BTreeMap::new();
         inputs.insert("reason".into(), Value::Text(reason.into()));
         self.append(
+            None,
             branch,
             Actor::System,
             "sys.branch.review",
@@ -439,9 +464,14 @@ where
     /// Egress intents are returned and not executed here.
     pub fn submit(&mut self, branch: &str, actor: Actor) -> Result<Vec<ObjectId>, BranchError> {
         self.rebase(branch)?;
-        if let Err(BranchError::Precondition(reason)) = self.preconditions_hold(branch) {
-            self.mark_pending(branch, &reason)?;
-            return Err(BranchError::Precondition(reason));
+        match self.preconditions_hold(branch) {
+            Ok(()) => {}
+            Err(BranchError::Precondition(reason)) => {
+                self.mark_pending(branch, &reason)?;
+                return Err(BranchError::Precondition(reason));
+            }
+            // A log that cannot be read back is not a reason to merge anyway.
+            Err(other) => return Err(other),
         }
         let state = self
             .branches
@@ -490,6 +520,7 @@ where
             });
         }
         self.append(
+            Some(new_tx),
             "main",
             actor,
             "sys.submit",
@@ -501,6 +532,7 @@ where
             None,
         )?;
         self.append(
+            None,
             branch,
             Actor::System,
             "sys.branch.submitted",
@@ -685,16 +717,62 @@ where
         ok
     }
 
-    fn find_tx(&self, branch: &str, tx: ObjectId) -> Option<LogEntry> {
-        self.store
-            .entries()
-            .into_iter()
-            .find(|e| e.branch == branch && e.tx == tx)
+    /// The entry for `tx` on `branch`, and whether it is still in force.
+    ///
+    /// Every transaction starts in force. A `sys.revert` X of Y puts X in force
+    /// and takes Y out. Reverting X later puts Y back, and so on down the chain,
+    /// so the state is replayed from the log rather than stored beside it.
+    fn find_tx_in_force(
+        &self,
+        branch: &str,
+        tx: ObjectId,
+    ) -> Result<(LogEntry, bool), BranchError> {
+        let mut found = None;
+        let mut target_of: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
+        let mut in_force: BTreeMap<ObjectId, bool> = BTreeMap::new();
+        for i in 0..self.store.len() {
+            let entry = self.store.get(i).ok_or(BranchError::BadEntry)?;
+            if entry.branch != branch {
+                continue;
+            }
+            if entry.action == "sys.revert" {
+                let target = match entry.inputs.get("reverts") {
+                    Some(Value::Text(s)) => {
+                        ObjectId::parse(s).map_err(|_| BranchError::BadEntry)?
+                    }
+                    _ => return Err(BranchError::BadEntry),
+                };
+                target_of.insert(entry.tx, target);
+                in_force.insert(entry.tx, true);
+                // Targets precede their reverts, so the chain is acyclic in any
+                // log this crate wrote; the bound only guards a corrupt one.
+                let mut cur = entry.tx;
+                let mut steps = 0;
+                while let Some(&below) = target_of.get(&cur) {
+                    steps += 1;
+                    if steps > target_of.len() {
+                        return Err(BranchError::BadEntry);
+                    }
+                    let flipped = !in_force.get(&cur).copied().unwrap_or(true);
+                    in_force.insert(below, flipped);
+                    cur = below;
+                }
+            }
+            if entry.tx == tx && found.is_none() {
+                found = Some(entry);
+            }
+        }
+        let entry = found.ok_or(BranchError::NotFound)?;
+        Ok((entry, in_force.get(&tx).copied().unwrap_or(true)))
     }
 
+    /// `tx` is the entry's audit id. Callers that hand an id back to their
+    /// caller (commit, revert, rebase, submit) pass it in so the two match;
+    /// markers let this mint one.
     #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
+        tx: Option<ObjectId>,
         branch: &str,
         actor: Actor,
         action: &str,
@@ -709,19 +787,14 @@ where
             Some((k, h)) => (Some(k), Some(h)),
             None => (None, None),
         };
-        let tx = {
-            let ms = self.clock.now_ms();
-            let rnd = self.rng.next_u128();
-            self.ids.next(ms, rnd)
+        let entry_tx = match tx {
+            Some(id) => id,
+            None => {
+                let ms = self.clock.now_ms();
+                let rnd = self.rng.next_u128();
+                self.ids.next(ms, rnd)
+            }
         };
-        // Writes already carry their own tx id in provenance when the caller set it.
-        // Fork and markers mint the entry id here; object provenance may differ by
-        // one mint. That is fine: the entry tx is the audit id.
-        let _ = tx;
-        let entry_tx = writes
-            .first()
-            .and_then(|w| w.after.provenance.tx)
-            .unwrap_or(tx);
         let entry = LogEntry {
             seq: self.store.len() as u64,
             branch: branch.into(),
@@ -740,7 +813,8 @@ where
             idempotency_input,
             hash: [0u8; 32],
         }
-        .seal();
+        .seal()
+        .map_err(|_| BranchError::Encoding)?;
         self.store
             .append(entry.clone())
             .map_err(|_| BranchError::Store)?;
@@ -833,9 +907,9 @@ where
         }
         for op in &entry.ledger {
             let spent = self.spent.entry(op.cap).or_default();
-            spent.cpu_ms += op.cpu_ms;
-            spent.gpu_ms += op.gpu_ms;
-            spent.money_fen += op.money_fen;
+            spent.cpu_ms = spent.cpu_ms.saturating_add(op.cpu_ms);
+            spent.gpu_ms = spent.gpu_ms.saturating_add(op.gpu_ms);
+            spent.money_fen = spent.money_fen.saturating_add(op.money_fen);
         }
         if let Some(Value::Bytes(n)) = entry.inputs.get("egress_nonce") {
             self.nonces.insert(n.clone());
@@ -886,7 +960,7 @@ fn add_edges(
         {
             list.push(RefEdge {
                 source: source.id,
-                field: field.into(),
+                field,
             });
         }
         rev = rev.insert(target, list);

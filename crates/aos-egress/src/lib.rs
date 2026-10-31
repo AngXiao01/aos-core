@@ -17,11 +17,11 @@ use aos_action::{
     authorize, authorize_intent, check_idempotency, check_type_allowed, ActionError, IdemHit,
 };
 use aos_branch::{OpenTx, QuotaSpent, World};
-use aos_cap::{Capability, Spent};
-use aos_confirm::{verify_decision, ConfirmError, ReplayGuard};
+use aos_cap::{covers, CapError, Capability, Spent};
+use aos_confirm::{decode_request, verify_decision, ConfirmError, Kind, ReplayGuard};
 use aos_log::{BlobStore, LogStore};
-use aos_policy::{verify_policy, IntentFacts, Policy};
-use aos_query::{execute, Page};
+use aos_policy::{evaluate, verify_policy, Decision, IntentFacts, Policy};
+use aos_query::{execute_with, Page};
 use aos_types::{
     sha256, Actor, Clock, ContentHash, Object, ObjectId, ObjectView, Query, Rng, Taint, Value,
 };
@@ -69,21 +69,26 @@ impl EgressTransport for RecordingTransport {
     }
 }
 
+/// What lets one send through the gate. Neither variant carries a public key:
+/// the gate verifies against the confirmer key it is given as its trust root,
+/// so a caller cannot sign its own permit.
 #[derive(Clone, Debug)]
 pub enum Permit {
+    /// A standing policy signed by the confirmer (§9.3). The gate evaluates
+    /// it against `facts` and sends only when the result is `allow`.
+    /// `facts.channel` must be the channel being sent on.
     Allow {
         policy: Policy,
         signature: Vec<u8>,
-        pubkey: Vec<u8>,
+        facts: IntentFacts,
     },
+    /// A one-time approval (§12.4). Channel, target, payload hash, nonce, and
+    /// expiry are read from `request_bytes`, which the signature covers;
+    /// nothing outside the signed bytes is trusted.
     Approval {
         request_bytes: Vec<u8>,
         decision: String,
         signature: Vec<u8>,
-        pubkey: Vec<u8>,
-        expires_at_ms: u64,
-        nonce: Vec<u8>,
-        item_payload_hash: [u8; 32],
     },
 }
 
@@ -100,10 +105,35 @@ pub enum GateError {
     Confirm(ConfirmError),
 }
 
+fn gate_error(e: ConfirmError) -> GateError {
+    match e {
+        ConfirmError::Expired => GateError::Expired,
+        ConfirmError::Replay => GateError::Replay,
+        other => GateError::Confirm(other),
+    }
+}
+
+/// Replay key for one approved item: the signed nonce followed by the item's
+/// index as a big-endian u32. One approval can list several items (§12.3);
+/// each may be sent once.
+pub fn replay_key(nonce: &[u8; 16], item_index: usize) -> Vec<u8> {
+    let mut key = nonce.to_vec();
+    key.extend_from_slice(&(item_index as u32).to_be_bytes());
+    key
+}
+
 /// Run the gate. `transport.send` is called only after every check succeeds.
+///
+/// `confirmer_pubkey` is the paired iPhone key (65-byte SEC1), the trust root
+/// for both approvals and standing policies (§9.3, §12.2). Invariants (§11.4):
+/// the payload hash is recomputed and must equal the hash inside the signed
+/// request; each approval item is consumed once, before its expiry, keyed by
+/// the signed nonce.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_gate<T: EgressTransport, G: ReplayGuard>(
     transport: &mut T,
     replay: &mut G,
+    confirmer_pubkey: &[u8],
     now_ms: u64,
     channel: &str,
     target: &str,
@@ -122,40 +152,49 @@ pub fn execute_gate<T: EgressTransport, G: ReplayGuard>(
         Permit::Allow {
             policy,
             signature,
-            pubkey,
+            facts,
         } => {
-            if !verify_policy(policy, pubkey, signature) {
+            if !verify_policy(policy, confirmer_pubkey, signature) {
                 return Err(GateError::Policy);
+            }
+            if facts.channel != channel {
+                return Err(GateError::Tamper);
+            }
+            match evaluate(policy, facts) {
+                Decision::Allow => {}
+                Decision::Confirm => return Err(GateError::NoPermit),
+                Decision::Deny => return Err(GateError::Denied),
             }
         }
         Permit::Approval {
             request_bytes,
             decision,
             signature,
-            pubkey,
-            expires_at_ms,
-            nonce,
-            item_payload_hash,
         } => {
-            if item_payload_hash != &actual {
-                return Err(GateError::Tamper);
-            }
             if decision != "approve" {
-                let _ = verify_decision(pubkey, request_bytes, decision, signature);
+                let _ = verify_decision(confirmer_pubkey, request_bytes, decision, signature);
                 return Err(GateError::Denied);
             }
-            verify_decision(pubkey, request_bytes, decision, signature).map_err(|e| match e {
-                ConfirmError::Expired => GateError::Expired,
-                ConfirmError::Replay => GateError::Replay,
-                other => GateError::Confirm(other),
-            })?;
-            replay
-                .consume(nonce, *expires_at_ms, now_ms)
-                .map_err(|e| match e {
-                    ConfirmError::Expired => GateError::Expired,
-                    ConfirmError::Replay => GateError::Replay,
-                    other => GateError::Confirm(other),
-                })?;
+            verify_decision(confirmer_pubkey, request_bytes, decision, signature)
+                .map_err(gate_error)?;
+            let req = decode_request(request_bytes).map_err(gate_error)?;
+            if req.kind != Kind::Egress {
+                return Err(GateError::Tamper);
+            }
+            let mut outcome = Err(GateError::Tamper);
+            for (index, item) in req.items.iter().enumerate() {
+                if item.channel != channel || item.target != target || item.payload_hash != actual {
+                    continue;
+                }
+                outcome = replay
+                    .consume(&replay_key(&req.nonce, index), req.expires_at_ms, now_ms)
+                    .map_err(gate_error);
+                // An identical item later in the list may still be unused.
+                if !matches!(outcome, Err(GateError::Replay)) {
+                    break;
+                }
+            }
+            outcome?;
         }
     }
     transport
@@ -167,8 +206,11 @@ pub fn execute_gate<T: EgressTransport, G: ReplayGuard>(
 
 pub struct Host<'a> {
     pub tx: &'a mut OpenTx,
+    cap: &'a Capability,
     reads: Vec<String>,
     writes: Vec<String>,
+    /// Channel patterns the action declared (`egress:` in §8.1).
+    egress: Vec<String>,
     pub violation: Option<String>,
 }
 
@@ -195,13 +237,24 @@ impl<'a> Host<'a> {
         Ok(())
     }
 
+    /// Every object that matched counts as read, not only the rows on this
+    /// page: counts, histograms, and means also carry its content to the
+    /// guest, and a tainted match must taint what the guest does next.
     pub fn query(&mut self, query: &Query) -> Result<Page, ActionError> {
         if let Err(e) = check_type_allowed(&self.reads, &query.from) {
             self.violate("undeclared query");
             return Err(e);
         }
-        let view = TxView { tx: self.tx };
-        execute(&view, query).map_err(|_| ActionError::UndeclaredType)
+        let mut matched = Vec::new();
+        let page = {
+            let view = TxView { tx: self.tx };
+            execute_with(&view, query, &mut |obj| matched.push(obj.clone()))
+                .map_err(|_| ActionError::UndeclaredType)?
+        };
+        for obj in &matched {
+            self.tx.note_read(obj);
+        }
+        Ok(page)
     }
 
     pub fn create_intent(
@@ -215,11 +268,22 @@ impl<'a> Host<'a> {
         cost_fen: i64,
         actor: Actor,
     ) -> Result<ObjectId, ActionError> {
+        // §9.1: creating an intent checks the token. §8.1: the action must
+        // have declared the channel. Either failure is a violation.
+        if !self.egress.iter().any(|p| covers(p, channel)) {
+            self.violate("undeclared egress channel");
+            return Err(ActionError::Capability(CapError::Channel));
+        }
+        if let Err(e) = authorize_intent(self.cap, channel) {
+            self.violate("egress channel outside capability");
+            return Err(e);
+        }
         let recipient_tainted = target_ref
             .and_then(|id| self.tx.get(&id))
             .map(|o| o.provenance.taint == Taint::External)
-            .unwrap_or(false);
-        let channel_tainted = channel_from_tainted_read(self.tx, channel);
+            .unwrap_or(false)
+            || text_from_tainted_read(self.tx, target);
+        let channel_tainted = text_from_tainted_read(self.tx, channel);
         let tainted = recipient_tainted || channel_tainted;
         let mut obj = Object::new(id, "sys/EgressIntent", 1, actor);
         obj.fields
@@ -259,19 +323,33 @@ impl<'a> Host<'a> {
     }
 }
 
-fn channel_from_tainted_read(tx: &OpenTx, channel: &str) -> bool {
-    for id in &tx.tainted_reads {
-        if let Some(obj) = tx.get(id) {
-            for value in obj.fields.values() {
-                if let Value::Text(s) = value {
-                    if s == channel {
-                        return true;
-                    }
-                }
-            }
+/// Whether `needle` appears inside any text this transaction read from a
+/// tainted object (§10: a channel or recipient that came from external
+/// content). Substring, not equality: a model lifts an address out of a
+/// sentence, it does not copy whole fields. Loose `extra` fields and nested
+/// lists and maps count too.
+fn text_from_tainted_read(tx: &OpenTx, needle: &str) -> bool {
+    fn contains(v: &Value, needle: &str) -> bool {
+        match v {
+            Value::Text(s) => s.contains(needle),
+            Value::List(xs) => xs.iter().any(|x| contains(x, needle)),
+            Value::Map(m) => m
+                .iter()
+                .any(|(k, x)| k.contains(needle) || contains(x, needle)),
+            _ => false,
         }
     }
-    false
+    if needle.is_empty() {
+        return false;
+    }
+    tx.tainted_reads.iter().any(|id| {
+        tx.get(id).is_some_and(|obj| {
+            obj.fields
+                .values()
+                .chain(obj.extra.values())
+                .any(|v| contains(v, needle))
+        })
+    })
 }
 
 struct TxView<'a> {
@@ -292,7 +370,7 @@ impl ObjectView for TxView<'_> {
                 if id == *target {
                     out.push(aos_types::RefEdge {
                         source: obj.id,
-                        field: field.into(),
+                        field,
                     });
                 }
             }
@@ -336,10 +414,9 @@ pub fn facts_from_intent(obj: &Object, day_spent_fen: u64) -> IntentFacts {
         Some(Value::Int(n)) if *n > 0 => *n as u64,
         _ => 0,
     };
-    let recipient_tainted = match obj.fields.get("target_ref") {
-        Some(Value::Ref(_)) => matches!(obj.fields.get("lineage_tainted"), Some(Value::Bool(true))),
-        _ => matches!(obj.fields.get("lineage_tainted"), Some(Value::Bool(true))),
-    };
+    // The intent stores one lineage bit for recipient and channel together.
+    // Reading it as recipient taint is the stricter choice for `when` rules.
+    let recipient_tainted = matches!(obj.fields.get("lineage_tainted"), Some(Value::Bool(true)));
     IntentFacts {
         channel,
         sensitivity,
@@ -403,8 +480,11 @@ where
         &delta,
         None,
     )?;
-    if let Some(key) = &req.idem_key {
-        let hash = aos_action::input_hash(&req.idem_parts);
+    let idem_hash = match &req.idem_key {
+        Some(_) => Some(aos_action::input_hash(&req.idem_parts)?),
+        None => None,
+    };
+    if let (Some(key), Some(hash)) = (&req.idem_key, idem_hash) {
         if let Some((prev, result)) = world.idempotent(req.branch, key) {
             match check_idempotency(Some(&prev), Some(&result), &hash)? {
                 IdemHit::Replay(v) => return Ok(v),
@@ -431,12 +511,14 @@ where
     }
     if let Some(key) = &req.idem_key {
         tx.idem_key = Some(key.clone());
-        tx.idem_input = Some(aos_action::input_hash(&req.idem_parts));
+        tx.idem_input = idem_hash;
     }
     let mut host = Host {
         tx: &mut tx,
+        cap: req.cap,
         reads: decl.reads.clone(),
         writes: decl.writes.clone(),
+        egress: decl.egress.clone(),
         violation: None,
     };
     let result = guest(&mut host);
@@ -454,8 +536,10 @@ where
         tx.inputs.insert("idem_result".into(), value.clone());
         tx.idem_key = Some(key);
     }
-    world.commit(tx).map_err(|_| ActionError::Precondition)?;
-    let _ = authorize_intent;
+    world.commit(tx).map_err(|e| match e {
+        aos_branch::BranchError::Encoding => ActionError::Encoding,
+        _ => ActionError::Precondition,
+    })?;
     Ok(value)
 }
 
@@ -613,11 +697,13 @@ mod tests {
 
     #[test]
     fn gate_rejects_without_touching_transport() {
+        let confirmer = crypto::public_uncompressed(&[5u8; 32]).unwrap();
         let mut transport = RecordingTransport::default();
         let mut replay = MemoryReplay::default();
         let err = execute_gate(
             &mut transport,
             &mut replay,
+            &confirmer,
             0,
             "deliver:test",
             "box",
@@ -628,19 +714,49 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, GateError::NoPermit);
         assert!(transport.sent.is_empty());
-        let _ = Decision::Confirm;
-        let _ = Sensitivity::Secret;
-        let _ = Rule {
-            effect: Decision::Deny,
-            channel: "*".into(),
-            max_sensitivity: Some(Sensitivity::Secret),
-            max_cost_fen_per_day: None,
-            when: None,
-        };
-        let _ = Policy {
+
+        // A permissive policy signed by a key that is not the confirmer.
+        let policy = Policy {
             name: "x".into(),
-            rules: Vec::new(),
+            rules: alloc::vec![Rule {
+                effect: Decision::Allow,
+                channel: "*".into(),
+                max_sensitivity: None,
+                max_cost_fen_per_day: None,
+                when: None,
+            }],
             default: Decision::Confirm,
         };
+        let signature = aos_policy::sign_policy(&policy, &[6u8; 32])
+            .unwrap()
+            .to_vec();
+        let permit = Permit::Allow {
+            policy,
+            signature,
+            facts: IntentFacts {
+                channel: "deliver:test".into(),
+                sensitivity: Sensitivity::Public,
+                cost_fen: 0,
+                day_spent_fen: 0,
+                recipient_tainted: false,
+                channel_tainted: false,
+                when_value: None,
+            },
+        };
+        let payload = b"payload";
+        let err = execute_gate(
+            &mut transport,
+            &mut replay,
+            &confirmer,
+            0,
+            "deliver:test",
+            "box",
+            payload,
+            &sha256(payload),
+            Some(&permit),
+        )
+        .unwrap_err();
+        assert_eq!(err, GateError::Policy);
+        assert!(transport.sent.is_empty());
     }
 }

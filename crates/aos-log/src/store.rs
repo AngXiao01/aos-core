@@ -60,7 +60,7 @@ impl LogStore for MemoryLog {
         if entry.prev_hash != self.tip_hash() {
             return Err(StoreError::Prev);
         }
-        if entry.hash != crate::entry::hash_entry(&entry) {
+        if crate::entry::hash_entry(&entry) != Ok(entry.hash) {
             return Err(StoreError::Hash);
         }
         self.entries.push(entry);

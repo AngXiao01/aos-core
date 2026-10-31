@@ -25,13 +25,13 @@
 |---|---|---|
 | `Clock` | `aos-types` | 当前 Unix 毫秒 |
 | `Rng` | `aos-types` | 测试和标识用的随机字节 |
-| `LogStore` | `aos-log` | 只追加的日志。`append` 必须拒绝序号、前哈希或条目哈希不对的写入 |
+| `LogStore` | `aos-log` | 只追加的日志。`append` 必须拒绝序号、前哈希或条目哈希不对的写入。`hash_entry` 返回 `Result`，`Err` 也按哈希不对处理 |
 | `BlobStore` | `aos-log` | 整块内容寻址。`put_chunked` 可以继续返回不支持，FastCDC 不是这一版的门 |
 | `ObjectView` | `aos-types` | 查询要的读接口。内存世界的 `branch_view` 已经实现 |
-| `ReplayGuard` | `aos-confirm` | 审批 nonce 只能用一次。过期直接拒绝 |
+| `ReplayGuard` | `aos-confirm` | 每个键只能用一次。过期直接拒绝。闸门传入的键是 `aos_egress::replay_key(nonce, 项序号)`，即 16 字节 nonce 后接 u32 大端序号，nonce 与过期时间都取自已签名的请求 |
 | `EgressTransport` | `aos-egress` | **唯一**可以对外写或对外发送的实现。库里的 `RecordingTransport` 只记字节，不开网络 |
 
-确认器验证吃 65 字节未压缩公钥和 64 字节 `r‖s` 签名。OS 给审批请求签名用 `aos_confirm::sign_request`。代替 iPhone 的软件签名只在 `aos-confirm` 的 `dev-confirmer` feature 里，并且 `not(debug_assertions)` 时编译失败。红色横幅由版本画，不由这个库画。
+确认器验证吃 65 字节未压缩公钥和 64 字节 `r‖s` 签名。`execute_gate` 的第三个参数是配对时存下的 iPhone 公钥，它是审批和常设规则的唯一信任根；`Permit` 不带公钥，审批的通道、目标、载荷哈希、nonce、过期时间都从签名覆盖的请求字节里解析，`Permit::Allow` 要附上由意图对象算出的 `IntentFacts`（`facts_from_intent`），闸门据此重新评估策略。OS 给审批请求签名用 `aos_confirm::sign_request`。代替 iPhone 的软件签名只在 `aos-confirm` 的 `dev-confirmer` feature 里，并且 `not(debug_assertions)` 时编译失败。红色横幅由版本画，不由这个库画。
 
 ## 组装
 

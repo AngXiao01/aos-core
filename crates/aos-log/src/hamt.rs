@@ -188,6 +188,14 @@ fn insert_node<K: HamtKey, V: Clone>(
             (join(shift, *h, a, hash, b), 1)
         }
         Node::Collision { hash: h, items } => {
+            if *h != hash {
+                // A different full hash only shares this node's slot prefix.
+                // Split here; pushing it into the bucket would turn every later
+                // key with the same prefix into a linear scan.
+                let a = Rc::new(node.clone());
+                let b = Rc::new(Node::Leaf { hash, key, value });
+                return (join(shift, *h, a, hash, b), 1);
+            }
             let mut items = items.clone();
             if let Some(pos) = items.iter().position(|(k, _)| k == &key) {
                 items[pos] = (key, value);
@@ -396,5 +404,51 @@ mod tests {
         m = m.remove(&K(1));
         assert!(m.get(&K(1)).is_none());
         assert_eq!(m.len(), 2);
+    }
+
+    fn max_bucket<K, V>(node: &Node<K, V>) -> usize {
+        match node {
+            Node::Leaf { .. } => 1,
+            Node::Collision { items, .. } => items.len(),
+            Node::Branch { children, .. } => {
+                children.iter().map(|c| max_bucket(c)).max().unwrap_or(0)
+            }
+        }
+    }
+
+    #[test]
+    fn collision_bucket_only_holds_equal_hashes() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct K(u64, u64);
+        impl HamtKey for K {
+            fn hamt_hash(&self) -> u64 {
+                self.0
+            }
+        }
+        let spread = |i: u64| i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        // A collision pair at the root used to swallow every later key.
+        let mut m = Hamt::new();
+        m = m.insert(K(7, 0), 0u64);
+        m = m.insert(K(7, 1), 1);
+        for i in 0..2_000u64 {
+            m = m.insert(K(spread(i), 10 + i), i);
+        }
+        assert_eq!(m.len(), 2_002);
+        assert!(max_bucket(m.root.as_ref().unwrap()) <= 2);
+        for i in 0..2_000u64 {
+            assert_eq!(m.get(&K(spread(i), 10 + i)), Some(&i));
+        }
+        assert_eq!(m.get(&K(7, 0)), Some(&0));
+        assert_eq!(m.get(&K(7, 1)), Some(&1));
+        for i in 0..2_000u64 {
+            m = m.remove(&K(spread(i), 10 + i));
+        }
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&K(7, 0)), Some(&0));
+        assert_eq!(m.get(&K(7, 1)), Some(&1));
+        // Same-hash keys still share one bucket, at any depth.
+        m = m.insert(K(7, 2), 2);
+        assert_eq!(m.get(&K(7, 2)), Some(&2));
+        assert_eq!(m.len(), 3);
     }
 }

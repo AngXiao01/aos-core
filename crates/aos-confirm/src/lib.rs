@@ -33,6 +33,15 @@ impl Kind {
             Kind::PolicyChange => "policy_change",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "egress" => Kind::Egress,
+            "task_capabilities" => Kind::TaskCapabilities,
+            "policy_change" => Kind::PolicyChange,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +81,8 @@ pub enum ConfirmError {
     Expired,
     Replay,
     HashMismatch,
+    /// Request bytes are not the canonical encoding of an `ApprovalRequest`.
+    Malformed,
 }
 
 pub const MAX_SUMMARY_LINES: usize = 12;
@@ -80,7 +91,106 @@ pub fn encode_request(req: &ApprovalRequest) -> Result<Vec<u8>, ConfirmError> {
     if req.summary.len() > MAX_SUMMARY_LINES {
         return Err(ConfirmError::SummaryTooLong);
     }
-    Ok(request_cbor(req).canonical().expect("request cbor"))
+    request_cbor(req)
+        .canonical()
+        .map_err(|_| ConfirmError::Malformed)
+}
+
+/// Parse signed request bytes back into the request the confirmer saw.
+///
+/// The bytes must be exactly `encode_request` of the result: extra keys,
+/// duplicate keys, or a non-canonical encoding are rejected, so every field a
+/// verifier reads is a field the signature covers.
+pub fn decode_request(bytes: &[u8]) -> Result<ApprovalRequest, ConfirmError> {
+    use ConfirmError::Malformed;
+    let root = aos_types::cbor::decode(bytes).map_err(|_| Malformed)?;
+    let req = ApprovalRequest {
+        request_id: ObjectId(fixed(field(&root, "request_id")?)?),
+        created_at_ms: uint(field(&root, "created_at")?)?,
+        expires_at_ms: uint(field(&root, "expires_at")?)?,
+        nonce: fixed(field(&root, "nonce")?)?,
+        kind: Kind::parse(text(field(&root, "kind")?)?).ok_or(Malformed)?,
+        summary: array(field(&root, "summary")?)?
+            .iter()
+            .map(|line| {
+                Ok(SummaryLine {
+                    label: text(field(line, "label")?)?.into(),
+                    value: text(field(line, "value")?)?.into(),
+                })
+            })
+            .collect::<Result<_, ConfirmError>>()?,
+        items: array(field(&root, "items")?)?
+            .iter()
+            .map(|item| {
+                Ok(ApprovalItem {
+                    channel: text(field(item, "channel")?)?.into(),
+                    target: text(field(item, "target")?)?.into(),
+                    payload_hash: fixed(field(item, "payload_hash")?)?,
+                    cost_fen: int(field(item, "cost")?)?,
+                    external_reversibility: text(field(item, "external_reversibility")?)?.into(),
+                    tainted: match field(item, "tainted")? {
+                        Cbor::Bool(b) => *b,
+                        _ => return Err(Malformed),
+                    },
+                })
+            })
+            .collect::<Result<_, ConfirmError>>()?,
+        branch: text(field(&root, "branch")?)?.into(),
+        diff_hash: fixed(field(&root, "diff_hash")?)?,
+    };
+    if encode_request(&req)? != bytes {
+        return Err(Malformed);
+    }
+    Ok(req)
+}
+
+fn field<'a>(map: &'a Cbor, name: &str) -> Result<&'a Cbor, ConfirmError> {
+    let Cbor::Map(pairs) = map else {
+        return Err(ConfirmError::Malformed);
+    };
+    pairs
+        .iter()
+        .find(|(k, _)| matches!(k, Cbor::Text(s) if s == name))
+        .map(|(_, v)| v)
+        .ok_or(ConfirmError::Malformed)
+}
+
+fn text(c: &Cbor) -> Result<&str, ConfirmError> {
+    match c {
+        Cbor::Text(s) => Ok(s),
+        _ => Err(ConfirmError::Malformed),
+    }
+}
+
+fn uint(c: &Cbor) -> Result<u64, ConfirmError> {
+    match c {
+        Cbor::Uint(n) => Ok(*n),
+        _ => Err(ConfirmError::Malformed),
+    }
+}
+
+fn int(c: &Cbor) -> Result<i64, ConfirmError> {
+    match c {
+        Cbor::Uint(n) => i64::try_from(*n).map_err(|_| ConfirmError::Malformed),
+        Cbor::Nint(n) => i64::try_from(*n)
+            .map(|n| -1 - n)
+            .map_err(|_| ConfirmError::Malformed),
+        _ => Err(ConfirmError::Malformed),
+    }
+}
+
+fn array(c: &Cbor) -> Result<&[Cbor], ConfirmError> {
+    match c {
+        Cbor::Array(xs) => Ok(xs),
+        _ => Err(ConfirmError::Malformed),
+    }
+}
+
+fn fixed<const N: usize>(c: &Cbor) -> Result<[u8; N], ConfirmError> {
+    match c {
+        Cbor::Bytes(b) => b.as_slice().try_into().map_err(|_| ConfirmError::Malformed),
+        _ => Err(ConfirmError::Malformed),
+    }
 }
 
 /// OS signs the canonical request bytes with its own key.
@@ -281,6 +391,25 @@ mod tests {
         assert_eq!(
             guard.consume(&[9], 10, 10).unwrap_err(),
             ConfirmError::Expired
+        );
+    }
+
+    #[test]
+    fn decode_request_roundtrips_and_rejects_non_canonical_bytes() {
+        let mut req = sample();
+        req.items[0].cost_fen = -7;
+        let bytes = encode_request(&req).unwrap();
+        assert_eq!(decode_request(&bytes).unwrap(), req);
+        // Same map with a trailing extra key: still valid CBOR, not the signed shape.
+        let mut extra = aos_types::cbor::decode(&bytes).unwrap();
+        if let Cbor::Map(pairs) = &mut extra {
+            pairs.push((Cbor::Text("zz".into()), Cbor::Null));
+        }
+        let extra = extra.canonical().unwrap();
+        assert_eq!(decode_request(&extra).unwrap_err(), ConfirmError::Malformed);
+        assert_eq!(
+            decode_request(&bytes[..bytes.len() - 1]).unwrap_err(),
+            ConfirmError::Malformed
         );
     }
 

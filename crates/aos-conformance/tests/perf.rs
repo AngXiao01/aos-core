@@ -1,5 +1,5 @@
 #[test]
-#[ignore = "performance probe; run with cargo test -p aos-conformance --release -- --ignored"]
+#[ignore = "performance probe; run with cargo test -p aos-conformance --release --no-default-features --test perf -- --ignored"]
 fn fork_commit_revert() {
     let (fork_ms, commit_ms, revert_ms) = aos_conformance::perf_fork_and_commit();
     eprintln!("fork_ms={fork_ms} commit_ms={commit_ms} revert_ms={revert_ms}");
@@ -9,7 +9,7 @@ fn fork_commit_revert() {
 }
 
 #[test]
-#[ignore = "performance probe; run with cargo test -p aos-conformance --release -- --ignored"]
+#[ignore = "performance probe; run with cargo test -p aos-conformance --release --no-default-features --test perf -- --ignored"]
 fn summary_million() {
     let ms = aos_conformance::perf_summary(1_000_000);
     eprintln!("summary_ms={ms}");
