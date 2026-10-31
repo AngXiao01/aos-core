@@ -1,0 +1,24 @@
+{
+  "type": "sys/Job",
+  "major": 1,
+  "fields": {
+    "state": {
+      "required": true
+    },
+    "kind": {
+      "required": true
+    },
+    "cost_cpu_ms": {
+      "required": true
+    },
+    "cost_gpu_ms": {
+      "required": true
+    },
+    "cost_money_fen": {
+      "required": true
+    },
+    "spec": {
+      "required": true
+    }
+  }
+}

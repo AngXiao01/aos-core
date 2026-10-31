@@ -1,0 +1,9 @@
+{
+  "type": "sys/Note",
+  "major": 1,
+  "fields": {
+    "text": {
+      "required": true
+    }
+  }
+}

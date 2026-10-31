@@ -1,0 +1,18 @@
+{
+  "type": "sys/Policy",
+  "major": 1,
+  "fields": {
+    "name": {
+      "required": true
+    },
+    "default_decision": {
+      "required": true
+    },
+    "rules": {
+      "required": true
+    },
+    "signature": {
+      "required": true
+    }
+  }
+}

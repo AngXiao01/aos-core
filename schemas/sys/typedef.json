@@ -1,0 +1,15 @@
+{
+  "type": "sys/TypeDef",
+  "major": 1,
+  "fields": {
+    "name": {
+      "required": true
+    },
+    "major": {
+      "required": true
+    },
+    "body": {
+      "required": true
+    }
+  }
+}

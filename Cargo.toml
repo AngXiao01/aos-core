@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aos-types",
+    "crates/aos-log",
+    "crates/aos-branch",
+    "crates/aos-cap",
+    "crates/aos-policy",
+    "crates/aos-action",
+    "crates/aos-egress",
+    "crates/aos-confirm",
+    "crates/aos-query",
+    "crates/aos-conformance",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.83"
+
+[workspace.dependencies]
+aos-types = { path = "crates/aos-types" }
+aos-log = { path = "crates/aos-log" }
+aos-branch = { path = "crates/aos-branch" }
+aos-cap = { path = "crates/aos-cap" }
+aos-policy = { path = "crates/aos-policy" }
+aos-action = { path = "crates/aos-action" }
+aos-egress = { path = "crates/aos-egress" }
+aos-confirm = { path = "crates/aos-confirm" }
+aos-query = { path = "crates/aos-query" }
+sha2 = { version = "0.10.8", default-features = false }
+half = { version = "2.4.1", default-features = false }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "arithmetic", "alloc"] }

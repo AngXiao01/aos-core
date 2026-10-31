@@ -1,0 +1,15 @@
+{
+  "type": "sys/Fact",
+  "major": 1,
+  "fields": {
+    "subject": {
+      "required": true
+    },
+    "predicate": {
+      "required": true
+    },
+    "object": {
+      "required": true
+    }
+  }
+}

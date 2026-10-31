@@ -1,0 +1,15 @@
+{
+  "type": "sys/Approval",
+  "major": 1,
+  "fields": {
+    "request_id": {
+      "required": true
+    },
+    "decision": {
+      "required": true
+    },
+    "nonce_hex": {
+      "required": true
+    }
+  }
+}
