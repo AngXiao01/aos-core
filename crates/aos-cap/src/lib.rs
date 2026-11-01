@@ -75,12 +75,18 @@ pub fn verify_token(cap: &Capability, public_key: &[u8]) -> Result<(), CapError>
 }
 
 /// `issuer` must be the parent subject. The child subject must be someone else.
+///
+/// The parent must carry a valid signature under the same key that will sign
+/// the child. Otherwise a caller could hand in an unsigned "parent" with any
+/// rights it likes and get them back as a properly signed child.
 pub fn attenuate(
     parent: &Capability,
     mut child: Capability,
     issuer: &Actor,
     seed32: &[u8; 32],
 ) -> Result<Capability, CapError> {
+    let signer = crypto::public_uncompressed(seed32).map_err(|_| CapError::BadSignature)?;
+    verify_token(parent, &signer)?;
     if issuer != &parent.subject {
         return Err(CapError::NotSubset);
     }
@@ -157,7 +163,13 @@ pub fn scope_allows(scope: &BTreeMap<String, Vec<ObjectId>>, field: &str, id: &O
     }
 }
 
+/// `delta` is a debit. Refunds only come from reverting the transaction that
+/// charged, which writes the negated ledger entry directly; a negative debit
+/// here would let any call hand itself quota back.
 pub fn ensure_quota(limits: &Limits, spent: &Spent, delta: &LedgerOp) -> Result<(), CapError> {
+    if delta.cpu_ms < 0 || delta.gpu_ms < 0 || delta.money_fen < 0 {
+        return Err(CapError::Quota);
+    }
     let cpu = spent.cpu_ms.saturating_add(delta.cpu_ms);
     let gpu = spent.gpu_ms.saturating_add(delta.gpu_ms);
     let money = spent.money_fen.saturating_add(delta.money_fen);
@@ -188,10 +200,10 @@ pub fn check_call(
     ensure_quota(&cap.limits, spent, delta)
 }
 
+/// An empty `egress_channels` list allows no channel. Reading it as "any"
+/// would also let `attenuate` widen a token, since an empty child list is
+/// trivially a subset of every parent list.
 pub fn check_channel(cap: &Capability, channel: &str) -> Result<(), CapError> {
-    if cap.limits.egress_channels.is_empty() {
-        return Ok(());
-    }
     if cap
         .limits
         .egress_channels
@@ -312,6 +324,33 @@ mod tests {
     }
 
     #[test]
+    fn forged_parent_and_empty_channel_list_do_not_widen() {
+        let seed = [9u8; 32];
+        let mut forged = root(ObjectId::from_parts(1, 1));
+        forged.rights = alloc::vec!["*".into()];
+        let mut child = root(ObjectId::from_parts(1, 2));
+        child.subject = Actor::AgentTask(child.id);
+        child.rights = alloc::vec!["anything".into()];
+        assert_eq!(
+            attenuate(&forged, child, &Actor::User, &seed).unwrap_err(),
+            CapError::BadSignature
+        );
+
+        let mut parent = root(ObjectId::from_parts(1, 1));
+        sign_token(&mut parent, &seed).unwrap();
+        let mut child = root(ObjectId::from_parts(1, 3));
+        child.subject = Actor::AgentTask(child.id);
+        child.rights = alloc::vec!["ml.dataset.read".into()];
+        child.limits.egress_channels = Vec::new();
+        let child = attenuate(&parent, child, &Actor::User, &seed).unwrap();
+        assert_eq!(
+            check_channel(&child, "deliver:anywhere").unwrap_err(),
+            CapError::Channel
+        );
+        assert!(check_channel(&parent, "deliver:x").is_ok());
+    }
+
+    #[test]
     fn quota_rolls_back_when_caller_does_not_commit() {
         let limits = Limits {
             cpu_ms: 100,
@@ -345,5 +384,17 @@ mod tests {
             CapError::Quota
         );
         assert_eq!(spent.cpu_ms, 0);
+        let refund = LedgerOp {
+            cpu_ms: -40,
+            ..delta.clone()
+        };
+        let busy = Spent {
+            cpu_ms: 90,
+            ..Spent::default()
+        };
+        assert_eq!(
+            ensure_quota(&limits, &busy, &refund).unwrap_err(),
+            CapError::Quota
+        );
     }
 }

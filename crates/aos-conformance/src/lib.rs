@@ -139,28 +139,67 @@ fn shell() -> Vis {
     }
 }
 
+/// Reference model for revert. Each transaction remembers, per object, the
+/// visible state before and after it. Reverting puts back only the attributes
+/// that transaction changed, which is what applying the stored inverse patch
+/// does; later changes to other attributes stay.
 struct Naive {
     objs: BTreeMap<ObjectId, Vis>,
-    txs: Vec<(ObjectId, Vec<(ObjectId, Option<Vis>)>)>,
+    txs: Vec<NaiveTx>,
+}
+
+struct NaiveTx {
+    id: ObjectId,
+    touched: Vec<(ObjectId, Vis, Vis)>,
+    reverted: bool,
 }
 
 impl Naive {
-    fn apply(
-        &mut self,
-        tx: ObjectId,
-        touched: &[(ObjectId, Option<Vis>)],
-        after: Vec<(ObjectId, Vis)>,
-    ) {
-        self.txs.push((tx, touched.to_vec()));
-        for (id, vis) in after {
-            self.objs.insert(id, vis);
+    fn apply(&mut self, tx: ObjectId, touched: Vec<(ObjectId, Vis, Vis)>) {
+        for (id, _, after) in &touched {
+            self.objs.insert(*id, after.clone());
         }
+        self.txs.push(NaiveTx {
+            id: tx,
+            touched,
+            reverted: false,
+        });
     }
 
     fn revert(&mut self, index: usize) {
-        let (_, before) = &self.txs[index];
-        for (id, prev) in before.clone() {
-            self.objs.insert(id, prev.unwrap_or_else(shell));
+        let touched = self.txs[index].touched.clone();
+        self.txs[index].reverted = true;
+        for (id, before, after) in touched {
+            let cur = self.objs.entry(id).or_insert_with(shell);
+            let keys: std::collections::BTreeSet<String> = before
+                .fields
+                .keys()
+                .chain(after.fields.keys())
+                .cloned()
+                .collect();
+            for k in keys {
+                if before.fields.get(&k) != after.fields.get(&k) {
+                    match before.fields.get(&k) {
+                        Some(v) => cur.fields.insert(k, v.clone()),
+                        None => cur.fields.remove(&k),
+                    };
+                }
+            }
+            if before.type_name != after.type_name {
+                cur.type_name = before.type_name.clone();
+            }
+            if before.taint != after.taint {
+                cur.taint = before.taint;
+            }
+            if before.sensitivity != after.sensitivity {
+                cur.sensitivity = before.sensitivity;
+            }
+            if before.tombstone != after.tombstone {
+                cur.tombstone = before.tombstone;
+            }
+            if before.major != after.major {
+                cur.major = before.major;
+            }
         }
     }
 }
@@ -180,7 +219,6 @@ pub fn revert_property() {
                 if model.objs.is_empty() || roll == 0 {
                     let id = world.mint();
                     let label = format!("n{}", rng.next_u64() % 50);
-                    let before = vec![(id, None)];
                     write_note(&mut world, id, &label);
                     // The create tx is the latest entry.
                     let tx = last_tx(&world);
@@ -189,7 +227,7 @@ pub fn revert_property() {
                     vis.major = 1;
                     vis.tombstone = false;
                     vis.fields.insert("text".into(), label);
-                    model.apply(tx, &before, vec![(id, vis)]);
+                    model.apply(tx, vec![(id, shell(), vis)]);
                 } else {
                     let keys: Vec<ObjectId> = model
                         .objs
@@ -201,33 +239,50 @@ pub fn revert_property() {
                         continue;
                     }
                     let id = keys[(rng.next_u64() as usize) % keys.len()];
-                    let before_vis = model.objs.get(&id).cloned();
+                    let before_vis = model.objs.get(&id).cloned().unwrap_or_else(shell);
+                    // Two independent attributes, so a revert of one update
+                    // has to leave a later update of the other alone.
+                    let field = if rng.next_u64() % 2 == 0 {
+                        "text"
+                    } else {
+                        "tag"
+                    };
                     let label = format!("u{}", rng.next_u64() % 50);
                     let mut tx = world
                         .open("main", Actor::User, "sys.object.update")
                         .unwrap();
                     let mut obj = tx.get(&id).unwrap();
-                    obj.fields.insert("text".into(), Value::Text(label.clone()));
+                    obj.fields.insert(field.into(), Value::Text(label.clone()));
                     if rng.next_u64() % 4 == 0 {
                         obj.provenance.taint = Taint::External;
                     }
                     let taint = obj.provenance.taint;
                     tx.put(obj);
                     let committed = world.commit(tx).unwrap();
-                    let mut vis = before_vis.clone().unwrap_or_else(shell);
-                    vis.fields.insert("text".into(), label);
+                    let mut vis = before_vis.clone();
+                    vis.fields.insert(field.into(), label);
                     vis.taint = taint;
                     vis.tombstone = false;
-                    model.apply(committed, &[(id, before_vis)], vec![(id, vis)]);
+                    model.apply(committed, vec![(id, before_vis, vis)]);
                 }
             } else {
                 let index = (rng.next_u64() as usize) % model.txs.len();
-                let tx = model.txs[index].0;
-                world.revert("main", tx, Actor::User).unwrap();
-                model.revert(index);
+                let tx = model.txs[index].id;
+                if model.txs[index].reverted {
+                    assert_eq!(
+                        world.revert("main", tx, Actor::User).unwrap_err(),
+                        BranchError::AlreadyReverted,
+                        "case {case}"
+                    );
+                } else {
+                    world.revert("main", tx, Actor::User).unwrap();
+                    model.revert(index);
+                }
             }
             assert_same(&world, &model, case);
         }
+        let folded = world.replayed().unwrap();
+        assert!(world.same_visible(&folded, "main"), "case {case} replay");
     }
 }
 
@@ -485,9 +540,7 @@ pub fn egress_gate() {
         diff_hash: [1u8; 32],
     };
     let bytes = encode_request(&req).unwrap();
-    std::fs::write("/tmp/aos-request.hex", aos_types::hex_encode(&bytes)).ok();
     let sig = dev::sign_decision(&seed, &bytes, "approve").unwrap();
-    std::fs::write("/tmp/aos-approve.sig.hex", aos_types::hex_encode(&sig)).ok();
     let os_seed = [9u8; 32];
     let os_sig = aos_confirm::sign_request(&os_seed, &bytes).unwrap();
     let os_pk = crypto::public_uncompressed(&os_seed).unwrap();
@@ -498,48 +551,124 @@ pub fn egress_gate() {
         request_bytes: bytes.clone(),
         decision: "approve".into(),
         signature: sig.to_vec(),
-        pubkey: pk.to_vec(),
-        expires_at_ms: 5_000,
-        nonce: req.nonce.to_vec(),
-        item_payload_hash: hash,
     };
-    let mut transport = RecordingTransport::default();
-    let mut replay = aos_confirm::MemoryReplay::default();
-    assert_eq!(
-        execute_gate(
+    // Every call checks that a rejected send never reaches the transport.
+    let gate = |replay: &mut aos_confirm::MemoryReplay,
+                trust: &[u8],
+                now: u64,
+                channel: &str,
+                target: &str,
+                body: &[u8],
+                expected: &[u8; 32],
+                permit: Option<&Permit>| {
+        let mut transport = RecordingTransport::default();
+        let out = execute_gate(
             &mut transport,
-            &mut replay,
-            1_500,
-            "deliver:test",
-            "box",
-            payload,
-            &[0u8; 32],
-            None
-        )
-        .unwrap_err(),
-        GateError::NoPermit
-    );
-    assert!(transport.sent.is_empty());
-
-    let mut transport = RecordingTransport::default();
-    let err = execute_gate(
-        &mut transport,
+            replay,
+            trust,
+            now,
+            channel,
+            target,
+            body,
+            expected,
+            permit,
+        );
+        match &out {
+            Ok(_) => assert_eq!(transport.sent.len(), 1),
+            Err(_) => assert!(transport.sent.is_empty()),
+        }
+        out
+    };
+    let mut replay = aos_confirm::MemoryReplay::default();
+    let no_permit = gate(
         &mut replay,
+        &pk,
+        1_500,
+        "deliver:test",
+        "box",
+        payload,
+        &[0u8; 32],
+        None,
+    );
+    assert_eq!(no_permit.unwrap_err(), GateError::NoPermit);
+
+    // "Reviewed A, sent B": the bytes must hash to what the confirmer signed.
+    let tampered = gate(
+        &mut replay,
+        &pk,
         1_500,
         "deliver:test",
         "box",
         b"tampered",
         &hash,
         Some(&permit),
-    )
-    .unwrap_err();
-    assert_eq!(err, GateError::Tamper);
-    assert!(transport.sent.is_empty());
-
-    let mut transport = RecordingTransport::default();
-    execute_gate(
-        &mut transport,
+    );
+    assert_eq!(tampered.unwrap_err(), GateError::Tamper);
+    let other_hash = sha256(b"tampered");
+    let swapped = gate(
         &mut replay,
+        &pk,
+        1_500,
+        "deliver:test",
+        "box",
+        b"tampered",
+        &other_hash,
+        Some(&permit),
+    );
+    assert_eq!(swapped.unwrap_err(), GateError::Tamper);
+
+    // The approval names one channel and one target; it covers no other.
+    let elsewhere = gate(
+        &mut replay,
+        &pk,
+        1_500,
+        "deliver:evil",
+        "box",
+        payload,
+        &hash,
+        Some(&permit),
+    );
+    assert_eq!(elsewhere.unwrap_err(), GateError::Tamper);
+    let redirected = gate(
+        &mut replay,
+        &pk,
+        1_500,
+        "deliver:test",
+        "attacker",
+        payload,
+        &hash,
+        Some(&permit),
+    );
+    assert_eq!(redirected.unwrap_err(), GateError::Tamper);
+
+    // A signature from any key other than the paired confirmer is worthless,
+    // even a valid one over the same bytes.
+    let rogue = [66u8; 32];
+    let rogue_pk = dev::public_key(&rogue).unwrap();
+    let self_signed = Permit::Approval {
+        request_bytes: bytes.clone(),
+        decision: "approve".into(),
+        signature: dev::sign_decision(&rogue, &bytes, "approve")
+            .unwrap()
+            .to_vec(),
+    };
+    let forged = gate(
+        &mut replay,
+        &pk,
+        1_500,
+        "deliver:test",
+        "box",
+        payload,
+        &hash,
+        Some(&self_signed),
+    );
+    assert!(matches!(forged.unwrap_err(), GateError::Confirm(_)));
+    let _ = rogue_pk;
+
+    // A failed check does not burn the nonce; the real send still goes through once.
+    gate(
+        &mut replay,
+        &pk,
         1_500,
         "deliver:test",
         "box",
@@ -548,41 +677,89 @@ pub fn egress_gate() {
         Some(&permit),
     )
     .unwrap();
-    assert_eq!(transport.sent.len(), 1);
-    assert_eq!(sha256(&transport.sent[0].payload), hash);
-
-    let mut transport = RecordingTransport::default();
-    let err = execute_gate(
-        &mut transport,
+    let again = gate(
         &mut replay,
+        &pk,
         1_500,
         "deliver:test",
         "box",
         payload,
         &hash,
         Some(&permit),
-    )
-    .unwrap_err();
-    assert_eq!(err, GateError::Replay);
-    assert!(transport.sent.is_empty());
+    );
+    assert_eq!(again.unwrap_err(), GateError::Replay);
 
-    let mut replay = aos_confirm::MemoryReplay::default();
-    let mut transport = RecordingTransport::default();
-    let err = execute_gate(
-        &mut transport,
-        &mut replay,
+    // Expiry is the signed `expires_at`, not a field the caller supplies.
+    let mut fresh = aos_confirm::MemoryReplay::default();
+    let late = gate(
+        &mut fresh,
+        &pk,
         5_000,
         "deliver:test",
         "box",
         payload,
         &hash,
         Some(&permit),
-    )
-    .unwrap_err();
-    assert_eq!(err, GateError::Expired);
-    assert!(transport.sent.is_empty());
+    );
+    assert_eq!(late.unwrap_err(), GateError::Expired);
 
-    let policy_seed = [4u8; 32];
+    // A deny decision never sends.
+    let deny = Permit::Approval {
+        request_bytes: bytes.clone(),
+        decision: "deny".into(),
+        signature: dev::sign_decision(&seed, &bytes, "deny").unwrap().to_vec(),
+    };
+    let denied = gate(
+        &mut fresh,
+        &pk,
+        1_500,
+        "deliver:test",
+        "box",
+        payload,
+        &hash,
+        Some(&deny),
+    );
+    assert_eq!(denied.unwrap_err(), GateError::Denied);
+
+    // One approval with two identical items allows exactly two sends.
+    let mut twice = req.clone();
+    twice.nonce = [8u8; 16];
+    twice.items.push(twice.items[0].clone());
+    let twice_bytes = encode_request(&twice).unwrap();
+    let twice_permit = Permit::Approval {
+        request_bytes: twice_bytes.clone(),
+        decision: "approve".into(),
+        signature: dev::sign_decision(&seed, &twice_bytes, "approve")
+            .unwrap()
+            .to_vec(),
+    };
+    let mut r2 = aos_confirm::MemoryReplay::default();
+    for _ in 0..2 {
+        gate(
+            &mut r2,
+            &pk,
+            1_500,
+            "deliver:test",
+            "box",
+            payload,
+            &hash,
+            Some(&twice_permit),
+        )
+        .unwrap();
+    }
+    let third = gate(
+        &mut r2,
+        &pk,
+        1_500,
+        "deliver:test",
+        "box",
+        payload,
+        &hash,
+        Some(&twice_permit),
+    );
+    assert_eq!(third.unwrap_err(), GateError::Replay);
+
+    // Standing policies: signed by the confirmer, then evaluated for this send.
     let policy = Policy {
         name: "allow-fetch".into(),
         default: Decision::Confirm,
@@ -594,28 +771,90 @@ pub fn egress_gate() {
             when: None,
         }],
     };
-    let psig = sign_policy(&policy, &policy_seed).unwrap();
-    let ppk = crypto::public_uncompressed(&policy_seed).unwrap();
-    assert!(verify_policy(&policy, &ppk, &psig));
-    let allow = Permit::Allow {
-        policy,
-        signature: psig.to_vec(),
-        pubkey: ppk.to_vec(),
+    let psig = sign_policy(&policy, &seed).unwrap();
+    assert!(verify_policy(&policy, &pk, &psig));
+    let facts = |channel: &str, tainted: bool| IntentFacts {
+        channel: channel.into(),
+        sensitivity: Sensitivity::Internal,
+        cost_fen: 0,
+        day_spent_fen: 0,
+        recipient_tainted: tainted,
+        channel_tainted: false,
+        when_value: None,
     };
-    let mut transport = RecordingTransport::default();
-    let mut replay = aos_confirm::MemoryReplay::default();
-    execute_gate(
-        &mut transport,
-        &mut replay,
+    let allow = |channel: &str, tainted: bool| Permit::Allow {
+        policy: policy.clone(),
+        signature: psig.to_vec(),
+        facts: facts(channel, tainted),
+    };
+    let mut r3 = aos_confirm::MemoryReplay::default();
+    let fetch = allow("fetch:registered-sources", false);
+    gate(
+        &mut r3,
+        &pk,
         1,
         "fetch:registered-sources",
         "src",
         payload,
         &hash,
-        Some(&allow),
+        Some(&fetch),
     )
     .unwrap();
-    assert_eq!(transport.sent.len(), 1);
+    // The same signed policy says nothing about other channels.
+    let off_policy = allow("deliver:customer", false);
+    let blocked = gate(
+        &mut r3,
+        &pk,
+        1,
+        "deliver:customer",
+        "x",
+        payload,
+        &hash,
+        Some(&off_policy),
+    );
+    assert_eq!(blocked.unwrap_err(), GateError::NoPermit);
+    // Facts for one channel cannot be replayed against another.
+    let mismatched = gate(
+        &mut r3,
+        &pk,
+        1,
+        "deliver:customer",
+        "x",
+        payload,
+        &hash,
+        Some(&fetch),
+    );
+    assert_eq!(mismatched.unwrap_err(), GateError::Tamper);
+    // Tainted lineage turns allow into confirm.
+    let tainted = allow("fetch:registered-sources", true);
+    let held = gate(
+        &mut r3,
+        &pk,
+        1,
+        "fetch:registered-sources",
+        "src",
+        payload,
+        &hash,
+        Some(&tainted),
+    );
+    assert_eq!(held.unwrap_err(), GateError::NoPermit);
+    // A policy signed by some other key is rejected.
+    let rogue_policy = Permit::Allow {
+        policy: policy.clone(),
+        signature: sign_policy(&policy, &rogue).unwrap().to_vec(),
+        facts: facts("fetch:registered-sources", false),
+    };
+    let rogue_sent = gate(
+        &mut r3,
+        &pk,
+        1,
+        "fetch:registered-sources",
+        "src",
+        payload,
+        &hash,
+        Some(&rogue_policy),
+    );
+    assert_eq!(rogue_sent.unwrap_err(), GateError::Policy);
 }
 
 pub fn taint_and_recipient() {
@@ -902,7 +1141,9 @@ fn write_note(world: &mut MemWorld, id: ObjectId, text: &str) {
 }
 
 /// Marked performance probes. They are ignored by default so correctness CI
-/// does not depend on a quiet machine. Run with `--ignored --release`.
+/// does not depend on a quiet machine. Run with
+/// `cargo test -p aos-conformance --release --no-default-features --test perf -- --ignored`;
+/// `dev-confirmer` (on by default here) refuses to compile in release.
 pub fn perf_fork_and_commit() -> (u128, u128, u128) {
     let mut world = MemWorld::memory(42);
     let started = std::time::Instant::now();

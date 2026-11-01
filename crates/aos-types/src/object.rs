@@ -237,13 +237,19 @@ impl Object {
         ]))
     }
 
-    /// Reference edges stored in fields. Used by the reverse index.
-    pub fn ref_edges(&self) -> Vec<(&str, ObjectId)> {
+    /// Top-level reference edges, for the reverse index. Declared fields use
+    /// their bare name; loose fields kept in `extra` use `extra.<name>`, so a
+    /// ref that `field_of` can resolve is always reachable from its target.
+    pub fn ref_edges(&self) -> Vec<(String, ObjectId)> {
         let mut out = Vec::new();
         for (name, value) in &self.fields {
-            match value {
-                Value::Ref(id) | Value::RefAt(id, _) => out.push((name.as_str(), *id)),
-                _ => {}
+            if let Value::Ref(id) | Value::RefAt(id, _) = value {
+                out.push((name.clone(), *id));
+            }
+        }
+        for (name, value) in &self.extra {
+            if let Value::Ref(id) | Value::RefAt(id, _) = value {
+                out.push((format!("extra.{name}"), *id));
             }
         }
         out
@@ -454,10 +460,7 @@ fn set_path(obj: &mut Object, path: &str, value: Value) -> Result<(), ()> {
             let Value::Int(n) = value else {
                 return Err(());
             };
-            if n < 0 {
-                return Err(());
-            }
-            obj.major = n as u32;
+            obj.major = u32::try_from(n).map_err(|_| ())?;
         }
         "origin" => {
             let Value::Text(s) = value else {
@@ -547,7 +550,7 @@ pub fn object_from_cbor(c: &Cbor) -> Result<Object, ()> {
             }
             "major" => {
                 let Cbor::Uint(n) = v else { return Err(()) };
-                major = *n as u32;
+                major = u32::try_from(*n).map_err(|_| ())?;
             }
             "version" => {
                 let Cbor::Uint(n) = v else { return Err(()) };

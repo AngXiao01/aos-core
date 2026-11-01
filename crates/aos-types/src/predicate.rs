@@ -1,6 +1,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::cbor::{Cbor, CborError};
 use crate::id::ObjectId;
@@ -110,14 +111,14 @@ fn compare(op: CmpOp, left: &Value, right: &Value) -> bool {
             _ => false,
         },
         CmpOp::Lt | CmpOp::Lte | CmpOp::Gt | CmpOp::Gte => {
-            let Some(ord) = num_cmp(left, right) else {
+            let Some(ord) = cmp_numbers(left, right) else {
                 return false;
             };
             match op {
-                CmpOp::Lt => ord < 0,
-                CmpOp::Lte => ord <= 0,
-                CmpOp::Gt => ord > 0,
-                CmpOp::Gte => ord >= 0,
+                CmpOp::Lt => ord == Ordering::Less,
+                CmpOp::Lte => ord != Ordering::Greater,
+                CmpOp::Gt => ord == Ordering::Greater,
+                CmpOp::Gte => ord != Ordering::Less,
                 _ => false,
             }
         }
@@ -130,29 +131,53 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::RefAt(x, xv), Value::RefAt(y, yv)) => x == y && xv == yv,
         (Value::Ref(x), Value::RefAt(y, _)) => x == y,
         (Value::RefAt(x, _), Value::Ref(y)) => x == y,
-        (Value::Int(x), Value::Float(y)) => *x as f64 == *y,
-        (Value::Float(x), Value::Int(y)) => *x == *y as f64,
+        (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+            cmp_numbers(a, b) == Some(Ordering::Equal)
+        }
         _ => a == b,
     }
 }
 
-fn num_cmp(a: &Value, b: &Value) -> Option<i8> {
-    let af = as_f64(a)?;
-    let bf = as_f64(b)?;
-    Some(if af < bf {
-        -1
-    } else if af > bf {
-        1
-    } else {
-        0
-    })
+/// Exact numeric ordering. Integers never pass through `f64`, so values above
+/// 2^53 (timestamps in µs, money in fen at scale) compare correctly.
+/// `None` when either side is not a number or is NaN.
+pub fn cmp_numbers(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
+        (Value::Int(x), Value::Float(y)) => cmp_int_float(*x, *y),
+        (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).map(Ordering::reverse),
+        _ => None,
+    }
 }
 
-fn as_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(n) => Some(*n as f64),
-        Value::Float(n) if n.is_finite() => Some(*n),
-        _ => None,
+fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
+    // 2^63 is exact in f64; every i64 lies in [-2^63, 2^63).
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    // In range, `as` truncates toward zero exactly. The truncated value is an
+    // integer of magnitude <= |f|, so converting it back to f64 is also exact.
+    let t = f as i64;
+    match i.cmp(&t) {
+        Ordering::Equal => {
+            let frac = f - t as f64;
+            Some(if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            })
+        }
+        other => Some(other),
     }
 }
 
@@ -220,5 +245,38 @@ mod tests {
         }]);
         let ok = eval_predicate(&pred, &mut |p| field_of(&obj, p));
         assert!(ok);
+    }
+
+    #[test]
+    fn numeric_comparison_is_exact_above_2_pow_53() {
+        let big = Value::Int(9_007_199_254_740_993); // 2^53 + 1
+        let below = Value::Int(9_007_199_254_740_992);
+        assert_eq!(cmp_numbers(&big, &below), Some(Ordering::Greater));
+        assert_eq!(
+            cmp_numbers(&big, &Value::Float(9_007_199_254_740_992.0)),
+            Some(Ordering::Greater)
+        );
+        assert!(!values_eq(&big, &Value::Float(9_007_199_254_740_992.0)));
+        assert!(values_eq(&Value::Int(3), &Value::Float(3.0)));
+        assert_eq!(
+            cmp_numbers(&Value::Int(3), &Value::Float(3.5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            cmp_numbers(&Value::Int(-3), &Value::Float(-3.5)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            cmp_numbers(&Value::Int(i64::MAX), &Value::Float(9.3e18)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            cmp_numbers(
+                &Value::Int(i64::MIN),
+                &Value::Float(-9_223_372_036_854_775_808.0)
+            ),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(cmp_numbers(&Value::Int(0), &Value::Float(f64::NAN)), None);
     }
 }

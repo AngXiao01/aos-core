@@ -161,26 +161,28 @@ impl<'a> Parser<'a> {
             0 => Ok(Cbor::Uint(self.argument(ai)?)),
             1 => Ok(Cbor::Nint(self.argument(ai)?)),
             2 => {
-                let n = self.argument(ai)? as usize;
+                let n = self.length(ai)?;
                 Ok(Cbor::Bytes(self.take(n)?.to_vec()))
             }
             3 => {
-                let n = self.argument(ai)? as usize;
+                let n = self.length(ai)?;
                 let b = self.take(n)?;
                 let s = core::str::from_utf8(b).map_err(|_| CborError::Unsupported)?;
                 Ok(Cbor::Text(s.into()))
             }
             4 => {
-                let n = self.argument(ai)? as usize;
-                let mut items = Vec::with_capacity(n);
+                let n = self.length(ai)?;
+                // Every item takes at least one byte, so the remaining input
+                // bounds the allocation. A hostile header cannot reserve more.
+                let mut items = Vec::with_capacity(n.min(self.remaining()));
                 for _ in 0..n {
                     items.push(self.read(depth + 1)?);
                 }
                 Ok(Cbor::Array(items))
             }
             5 => {
-                let n = self.argument(ai)? as usize;
-                let mut pairs = Vec::with_capacity(n);
+                let n = self.length(ai)?;
+                let mut pairs = Vec::with_capacity(n.min(self.remaining() / 2));
                 for _ in 0..n {
                     let k = self.read(depth + 1)?;
                     let v = self.read(depth + 1)?;
@@ -266,8 +268,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Length argument of a string, array, or map header.
+    fn length(&mut self, ai: u8) -> Result<usize, CborError> {
+        let n = self.argument(ai)?;
+        usize::try_from(n).map_err(|_| CborError::Truncated)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.i
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], CborError> {
-        if self.i + n > self.bytes.len() {
+        if n > self.remaining() {
             return Err(CborError::Truncated);
         }
         let s = &self.bytes[self.i..self.i + n];
@@ -326,6 +338,24 @@ mod tests {
         assert_eq!(
             Cbor::Float(f64::NAN).canonical().unwrap_err(),
             CborError::NonFiniteFloat
+        );
+    }
+
+    #[test]
+    fn hostile_lengths_are_errors_not_panics() {
+        // byte string of 2^64-1 bytes: `i + n` used to overflow.
+        assert_eq!(
+            decode(&[0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).unwrap_err(),
+            CborError::Truncated
+        );
+        // array of 2^63 items: used to request a 2^63-element allocation.
+        assert_eq!(
+            decode(&[0x9b, 0x80, 0, 0, 0, 0, 0, 0, 0]).unwrap_err(),
+            CborError::Truncated
+        );
+        assert_eq!(
+            decode(&[0xba, 0xff, 0xff, 0xff, 0xff]).unwrap_err(),
+            CborError::Truncated
         );
     }
 

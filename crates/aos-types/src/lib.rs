@@ -25,7 +25,7 @@ pub use object::{
     absent_shell, apply_patch, diff_objects, invert_patch, propagate_taint, Actor, Object, Patch,
     Provenance, Sensitivity, Taint,
 };
-pub use predicate::{eval_predicate, field_of, resolve_input_path, CmpOp, Predicate};
+pub use predicate::{cmp_numbers, eval_predicate, field_of, resolve_input_path, CmpOp, Predicate};
 pub use query::{Aggregate, OrderDir, OrderKey, Query};
 pub use schema::{builtin_actions, builtin_types, ActionDecl, FieldType, TypeDef};
 pub use traits::{Clock, ManualClock, ManualRng, ObjectView, RefEdge, Rng};

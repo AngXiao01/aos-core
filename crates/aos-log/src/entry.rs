@@ -2,6 +2,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use aos_types::cbor::CborError;
 use aos_types::{sha256, Actor, Cbor, ContentHash, Object, ObjectId, Patch, Predicate, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,9 +28,9 @@ impl LedgerOp {
     pub fn negated(&self) -> Self {
         Self {
             cap: self.cap,
-            cpu_ms: -self.cpu_ms,
-            gpu_ms: -self.gpu_ms,
-            money_fen: -self.money_fen,
+            cpu_ms: self.cpu_ms.saturating_neg(),
+            gpu_ms: self.gpu_ms.saturating_neg(),
+            money_fen: self.money_fen.saturating_neg(),
         }
     }
 }
@@ -55,23 +56,26 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    pub fn seal(mut self) -> Self {
-        self.hash = hash_entry(&self);
-        self
+    /// Fill in `hash`. Fails when any value has no canonical CBOR form
+    /// (NaN or infinite floats, nesting deeper than the codec allows); such an
+    /// entry cannot be hashed and so must not reach the log.
+    pub fn seal(mut self) -> Result<Self, CborError> {
+        self.hash = hash_entry(&self)?;
+        Ok(self)
     }
 }
 
-pub fn hash_entry(entry: &LogEntry) -> [u8; 32] {
-    let bytes = entry_cbor(entry)
-        .canonical()
-        .expect("log entry is finite CBOR");
-    sha256(&bytes)
+/// `SHA-256(canonical_cbor(entry without hash))`. Every field is covered; a
+/// value that cannot be encoded is an error, never silently left out.
+pub fn hash_entry(entry: &LogEntry) -> Result<[u8; 32], CborError> {
+    let bytes = entry_cbor(entry)?.canonical()?;
+    Ok(sha256(&bytes))
 }
 
 pub fn verify_chain(entries: &[LogEntry]) -> Result<(), usize> {
     let mut prev = [0u8; 32];
     for (i, e) in entries.iter().enumerate() {
-        if e.seq != i as u64 || e.prev_hash != prev || e.hash != hash_entry(e) {
+        if e.seq != i as u64 || e.prev_hash != prev || hash_entry(e) != Ok(e.hash) {
             return Err(i);
         }
         prev = e.hash;
@@ -79,10 +83,10 @@ pub fn verify_chain(entries: &[LogEntry]) -> Result<(), usize> {
     Ok(())
 }
 
-fn entry_cbor(e: &LogEntry) -> Cbor {
+fn entry_cbor(e: &LogEntry) -> Result<Cbor, CborError> {
     let mut writes = Vec::new();
     for w in &e.writes {
-        writes.push(write_cbor(w));
+        writes.push(write_cbor(w)?);
     }
     let mut ledger = Vec::new();
     for op in &e.ledger {
@@ -95,21 +99,17 @@ fn entry_cbor(e: &LogEntry) -> Cbor {
     }
     let mut inputs = Vec::new();
     for (k, v) in &e.inputs {
-        if let Ok(c) = v.to_cbor() {
-            inputs.push((Cbor::Text(k.clone()), c));
-        }
+        inputs.push((Cbor::Text(k.clone()), v.to_cbor()?));
     }
     let mut preds = Vec::new();
     for p in &e.preconditions {
-        if let Ok(c) = p.to_cbor() {
-            preds.push(c);
-        }
+        preds.push(p.to_cbor()?);
     }
     let mut intents = Vec::new();
     for id in &e.intents {
         intents.push(Cbor::Bytes(id.0.to_vec()));
     }
-    Cbor::Map(alloc::vec![
+    Ok(Cbor::Map(alloc::vec![
         (Cbor::Text("seq".into()), Cbor::Uint(e.seq)),
         (Cbor::Text("branch".into()), Cbor::Text(e.branch.clone())),
         (Cbor::Text("tx".into()), Cbor::Bytes(e.tx.0.to_vec())),
@@ -146,15 +146,15 @@ fn entry_cbor(e: &LogEntry) -> Cbor {
                 None => Cbor::Null,
             },
         ),
-    ])
+    ]))
 }
 
-fn write_cbor(w: &WriteRecord) -> Cbor {
-    let patch = w.patch.to_cbor().unwrap_or(Cbor::Null);
-    let inverse = w.inverse.to_cbor().unwrap_or(Cbor::Null);
-    let before = w.before.to_cbor().unwrap_or(Cbor::Null);
-    let after = w.after.to_cbor().unwrap_or(Cbor::Null);
-    Cbor::Map(alloc::vec![
+fn write_cbor(w: &WriteRecord) -> Result<Cbor, CborError> {
+    let patch = w.patch.to_cbor()?;
+    let inverse = w.inverse.to_cbor()?;
+    let before = w.before.to_cbor()?;
+    let after = w.after.to_cbor()?;
+    Ok(Cbor::Map(alloc::vec![
         (Cbor::Text("id".into()), Cbor::Bytes(w.id.0.to_vec())),
         (
             Cbor::Text("prev_version".into()),
@@ -165,7 +165,7 @@ fn write_cbor(w: &WriteRecord) -> Cbor {
         (Cbor::Text("inverse".into()), inverse),
         (Cbor::Text("before".into()), before),
         (Cbor::Text("after".into()), after),
-    ])
+    ]))
 }
 
 fn i64_cbor(n: i64) -> Cbor {

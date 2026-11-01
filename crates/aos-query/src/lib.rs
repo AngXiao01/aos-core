@@ -7,13 +7,14 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use aos_types::{
-    field_of, hex_decode, hex_encode, sha256, Aggregate, Cbor, CmpOp, ContentHash, Object,
-    ObjectId, ObjectView, OrderDir, OrderKey, Predicate, Query, RefEdge, Value,
+    cmp_numbers, field_of, hex_decode, hex_encode, sha256, Aggregate, Cbor, CmpOp, ContentHash,
+    Object, ObjectId, ObjectView, OrderDir, OrderKey, Predicate, Query, RefEdge, Value,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,11 +35,27 @@ pub enum QueryError {
 }
 
 pub fn execute(view: &dyn ObjectView, query: &Query) -> Result<Page, QueryError> {
+    execute_with(view, query, &mut |_| {})
+}
+
+/// Like [`execute`], and calls `on_match` once for every object that passed
+/// the filter, before paging. Aggregates are computed over all of them, so a
+/// host that tracks what a guest has seen (taint lineage) needs the full set,
+/// not just the returned rows.
+pub fn execute_with(
+    view: &dyn ObjectView,
+    query: &Query,
+    on_match: &mut dyn FnMut(&Object),
+) -> Result<Page, QueryError> {
     let mut matched: Vec<Object> = Vec::new();
-    if let Some(seed) = ref_seed(query.filter.as_ref()) {
-        let edges = view.reverse(&seed.1);
-        for edge in edges {
-            if edge.field != seed.0 {
+    if let Some(target) = ref_seed(query.filter.as_ref()) {
+        // The reverse index only proposes candidates; `passes` re-checks the
+        // full predicate. Edge field names are not compared here because the
+        // filter may spell the path as `x`, `fields.x`, or reach `extra.x`
+        // through `field_of`'s fallback.
+        let mut seen = BTreeSet::new();
+        for edge in view.reverse(&target) {
+            if !seen.insert(edge.source) {
                 continue;
             }
             if let Some(obj) = view.get(&edge.source) {
@@ -54,7 +71,15 @@ pub fn execute(view: &dyn ObjectView, query: &Query) -> Result<Page, QueryError>
             }
         });
     }
+    // Validate the cursor before reporting matches, so a bad request reveals nothing.
+    let cursor = match &query.cursor {
+        Some(cur) => Some(decode_cursor(cur)?),
+        None => None,
+    };
     matched.sort_by(|a, b| cmp_objects(a, b, &query.order_by));
+    for obj in &matched {
+        on_match(obj);
+    }
     let count = matched.len() as u64;
     let histogram = if let Some(field) = &query.aggregate.histogram {
         let mut h = BTreeMap::new();
@@ -88,15 +113,16 @@ pub fn execute(view: &dyn ObjectView, query: &Query) -> Result<Page, QueryError>
     } else {
         None
     };
-    if let Some(cur) = &query.cursor {
-        let key = decode_cursor(cur)?;
-        matched.retain(|obj| cmp_cursor(obj, &query.order_by, &key) > 0);
+    if let Some(key) = &cursor {
+        matched.retain(|obj| cmp_cursor(obj, &query.order_by, key) > 0);
     }
     let limit = query.effective_limit();
     let mut next_cursor = None;
     if matched.len() > limit {
-        let last = &matched[limit - 1];
-        next_cursor = Some(encode_cursor(last, &query.order_by));
+        // `limit: 0` asks for aggregates only; there is no last row to resume after.
+        if let Some(last) = limit.checked_sub(1).map(|i| &matched[i]) {
+            next_cursor = Some(encode_cursor(last, &query.order_by));
+        }
         matched.truncate(limit);
     }
     let rows = matched
@@ -124,14 +150,14 @@ fn passes(obj: &Object, query: &Query) -> bool {
 }
 
 /// A top-level equality on a ref, or one inside `all`, can use the reverse index.
-fn ref_seed(pred: Option<&Predicate>) -> Option<(String, ObjectId)> {
+fn ref_seed(pred: Option<&Predicate>) -> Option<ObjectId> {
     let pred = pred?;
     match pred {
         Predicate::Cmp {
-            field,
             op: CmpOp::Eq,
             value: Value::Ref(id) | Value::RefAt(id, _),
-        } => Some((field.clone(), *id)),
+            ..
+        } => Some(*id),
         Predicate::All(xs) => {
             for p in xs {
                 if let Some(s) = ref_seed(Some(p)) {
@@ -169,22 +195,58 @@ fn cmp_opt_value(a: Option<&Value>, b: Option<&Value>) -> core::cmp::Ordering {
     }
 }
 
-fn cmp_value(a: &Value, b: &Value) -> core::cmp::Ordering {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => {
-            x.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal)
-        }
-        (Value::Int(x), Value::Float(y)) => (*x as f64)
-            .partial_cmp(y)
-            .unwrap_or(core::cmp::Ordering::Equal),
-        (Value::Float(x), Value::Int(y)) => x
-            .partial_cmp(&(*y as f64))
-            .unwrap_or(core::cmp::Ordering::Equal),
-        (Value::Text(x), Value::Text(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => display_value(a).cmp(&display_value(b)),
+/// Sort rank of a value's kind. Values of different kinds never compare by
+/// their display text: `10 > 9 > "10" == 10` is not an order, and the
+/// standard sort may panic on a comparator that is not total.
+fn kind_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Bytes(_) => 4,
+        Value::Ref(_) | Value::RefAt(_, _) => 5,
+        Value::List(_) => 6,
+        Value::Map(_) => 7,
     }
+}
+
+/// Total order over values: kind first, then a per-kind order. Numbers compare
+/// exactly across `Int` and `Float`; NaN sorts after every other number.
+fn cmp_value(a: &Value, b: &Value) -> Ordering {
+    let by_kind = kind_rank(a).cmp(&kind_rank(b));
+    if by_kind != Ordering::Equal {
+        return by_kind;
+    }
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+        (Value::Ref(_) | Value::RefAt(_, _), Value::Ref(_) | Value::RefAt(_, _)) => {
+            ref_key(a).cmp(&ref_key(b))
+        }
+        (Value::Int(_) | Value::Float(_), _) => {
+            cmp_numbers(a, b).unwrap_or_else(|| is_nan(a).cmp(&is_nan(b)))
+        }
+        (Value::List(_) | Value::Map(_), _) => {
+            let ea = a.canonical().unwrap_or_default();
+            let eb = b.canonical().unwrap_or_default();
+            ea.cmp(&eb)
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+fn ref_key(v: &Value) -> (ObjectId, Option<u64>) {
+    match v {
+        Value::Ref(id) => (*id, None),
+        Value::RefAt(id, ver) => (*id, Some(*ver)),
+        _ => (ObjectId::ZERO, None),
+    }
+}
+
+fn is_nan(v: &Value) -> bool {
+    matches!(v, Value::Float(n) if n.is_nan())
 }
 
 fn display_value(v: &Value) -> String {
@@ -259,16 +321,23 @@ fn project(obj: &Object, select: &[String]) -> BTreeMap<String, Value> {
 }
 
 struct CursorKey {
-    values: Vec<Value>,
+    /// `None` when the last row had no value for that sort key. A missing
+    /// value sorts after every present one, so it must not be confused with
+    /// an explicit `null`, which sorts first.
+    values: Vec<Option<Value>>,
     id: ObjectId,
 }
 
+/// Each sort key is `[]` (missing) or `[value]` (present).
 fn encode_cursor(obj: &Object, order: &[OrderKey]) -> String {
     let mut vals = Vec::new();
     for key in order {
         vals.push(match field_of(obj, &key.field) {
-            Some(v) => v.to_cbor().unwrap_or(Cbor::Null),
-            None => Cbor::Null,
+            Some(v) => match v.to_cbor() {
+                Ok(c) => Cbor::Array(alloc::vec![c]),
+                Err(_) => Cbor::Array(Vec::new()),
+            },
+            None => Cbor::Array(Vec::new()),
         });
     }
     let cbor = Cbor::Array(alloc::vec![
@@ -300,7 +369,14 @@ fn decode_cursor(hex: &str) -> Result<CursorKey, QueryError> {
     id.copy_from_slice(idb);
     let mut values = Vec::new();
     for v in vals {
-        values.push(Value::from_cbor(v).map_err(|_| QueryError::Cursor)?);
+        let Cbor::Array(slot) = v else {
+            return Err(QueryError::Cursor);
+        };
+        values.push(match slot.as_slice() {
+            [] => None,
+            [present] => Some(Value::from_cbor(present).map_err(|_| QueryError::Cursor)?),
+            _ => return Err(QueryError::Cursor),
+        });
     }
     Ok(CursorKey {
         values,
@@ -311,7 +387,7 @@ fn decode_cursor(hex: &str) -> Result<CursorKey, QueryError> {
 fn cmp_cursor(obj: &Object, order: &[OrderKey], key: &CursorKey) -> i8 {
     for (i, ord) in order.iter().enumerate() {
         let left = field_of(obj, &ord.field);
-        let right = key.values.get(i);
+        let right = key.values.get(i).and_then(|v| v.as_ref());
         let cmp = cmp_opt_value(left.as_ref(), right);
         let cmp = match ord.dir {
             OrderDir::Asc => cmp,
@@ -332,10 +408,16 @@ fn cmp_cursor(obj: &Object, order: &[OrderKey], key: &CursorKey) -> i8 {
     }
 }
 
+/// Arrays and objects nested deeper than this are rejected. Parsing recurses,
+/// so an unbounded depth lets one request overflow the stack. The canonical
+/// CBOR codec has the same ceiling, so nothing deeper could be stored anyway.
+const MAX_JSON_DEPTH: usize = 64;
+
 pub fn parse_query(json: &str) -> Result<Query, QueryError> {
     let mut p = Parser {
         bytes: json.as_bytes(),
         i: 0,
+        depth: 0,
     };
     let v = p.parse_value()?;
     p.skip();
@@ -357,6 +439,7 @@ enum Json {
 struct Parser<'a> {
     bytes: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -368,11 +451,62 @@ impl<'a> Parser<'a> {
             b't' => self.consume(b"true").map(|_| Json::Bool(true)),
             b'f' => self.consume(b"false").map(|_| Json::Bool(false)),
             b'"' => Ok(Json::String(self.string()?)),
-            b'[' => self.array(),
-            b'{' => self.object(),
+            b'[' | b'{' => {
+                if self.depth >= MAX_JSON_DEPTH {
+                    return Err(QueryError::Json(self.i));
+                }
+                self.depth += 1;
+                let v = if b == b'[' {
+                    self.array()
+                } else {
+                    self.object()
+                };
+                self.depth -= 1;
+                v
+            }
             b'-' | b'0'..=b'9' => self.number(),
             _ => Err(QueryError::Json(self.i)),
         }
+    }
+
+    fn hex4(&mut self) -> Result<u32, QueryError> {
+        let digits = self
+            .bytes
+            .get(self.i..self.i + 4)
+            .ok_or(QueryError::Json(self.i))?;
+        let mut n = 0u32;
+        for &d in digits {
+            let v = (d as char).to_digit(16).ok_or(QueryError::Json(self.i))?;
+            n = (n << 4) | v;
+        }
+        self.i += 4;
+        Ok(n)
+    }
+
+    /// `\uXXXX`, with UTF-16 surrogate pairs. Agents often send ASCII-only
+    /// JSON (Python's default), so every non-ASCII character arrives this way.
+    fn unicode_escape(&mut self, out: &mut Vec<u8>) -> Result<(), QueryError> {
+        let at = self.i;
+        let hi = self.hex4()?;
+        let code = match hi {
+            0xD800..=0xDBFF => {
+                if self.bytes.get(self.i..self.i + 2) != Some(b"\\u") {
+                    return Err(QueryError::Json(at));
+                }
+                self.i += 2;
+                let lo = self.hex4()?;
+                if !(0xDC00..=0xDFFF).contains(&lo) {
+                    return Err(QueryError::Json(at));
+                }
+                0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+            }
+            0xDC00..=0xDFFF => return Err(QueryError::Json(at)),
+            n => n,
+        };
+        let c = char::from_u32(code).ok_or(QueryError::Json(at))?;
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        Ok(())
     }
 
     fn consume(&mut self, lit: &[u8]) -> Result<(), QueryError> {
@@ -399,6 +533,9 @@ impl<'a> Parser<'a> {
                         b'n' => out.push(b'\n'),
                         b't' => out.push(b'\t'),
                         b'r' => out.push(b'\r'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'u' => self.unicode_escape(&mut out)?,
                         _ => return Err(QueryError::Json(self.i)),
                     }
                 }
@@ -741,7 +878,7 @@ mod tests {
                     if id == *target {
                         out.push(RefEdge {
                             source: o.id,
-                            field: field.into(),
+                            field,
                         });
                     }
                 }

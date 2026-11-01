@@ -125,18 +125,19 @@ impl IdGen {
     }
 
     pub fn next(&mut self, now_ms: u64, random: u128) -> ObjectId {
-        let mut rnd = random & ((1u128 << 80) - 1);
-        if now_ms == self.last_ms || now_ms < self.last_ms {
-            rnd = self.last_rand.saturating_add(1) & ((1u128 << 80) - 1);
-            if rnd == 0 {
-                rnd = 1;
+        const MASK: u128 = (1u128 << 80) - 1;
+        let mut rnd = random & MASK;
+        let mut ms = now_ms;
+        if now_ms <= self.last_ms {
+            ms = self.last_ms;
+            if self.last_rand == MASK {
+                // The 80-bit field is exhausted for this millisecond. Borrow the
+                // next one instead of wrapping, which would sort backwards.
+                ms = self.last_ms + 1;
+            } else {
+                rnd = self.last_rand + 1;
             }
         }
-        let ms = if now_ms < self.last_ms {
-            self.last_ms
-        } else {
-            now_ms
-        };
         self.last_ms = ms;
         self.last_rand = rnd;
         ObjectId::from_parts(ms, rnd)
@@ -188,5 +189,15 @@ mod tests {
         let b = gen.next(10, 5);
         assert!(b.random_bits() > a.random_bits());
         assert_eq!(a.timestamp_ms(), b.timestamp_ms());
+    }
+
+    #[test]
+    fn monotonic_when_random_field_overflows() {
+        let mut gen = IdGen::new();
+        let a = gen.next(10, (1u128 << 80) - 1);
+        let b = gen.next(10, 5);
+        let c = gen.next(9, 0);
+        assert!(a < b && b < c, "{a} {b} {c}");
+        assert_eq!(b.timestamp_ms(), 11);
     }
 }
