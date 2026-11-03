@@ -4,6 +4,10 @@ AOS（agent-native OS）的运行时版：作为常驻程序直接运行在现�
 
 本仓库自成一体，不依赖任何其他仓库。唯一的规格文件是 [`SPEC.md`](SPEC.md)，第一部分规定系统语义，第二部分规定平台实现。
 
+## 现状
+
+核心库已在 `main`：§18 列出的 10 个 crate 放在 `crates/`，做到 M0–M3；§16.1 的一致性测试在内存后端上通过。未写死的选择、规格矛盾，以及存储与出口 trait 的交接，分别见 [`DECISIONS.md`](DECISIONS.md)、[`QUESTIONS.md`](QUESTIONS.md)、[`docs/trait-handoff.md`](docs/trait-handoff.md)。
+
 ## 给实现 agent
 
 1. 先读 `SPEC.md` 的 §0，再通读全文。
